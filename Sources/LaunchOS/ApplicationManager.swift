@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import SwiftUI
 import CoreData
 import Combine
 import SQLite3
@@ -181,6 +182,27 @@ public final class ApplicationManager: ObservableObject {
     @Published public var openedFolderID: String? = nil
     @Published public var selectedGroupIDs: Set<String> = []
     @Published public var isUninstallJiggleMode: Bool = false
+    /// In-place title editor target on the main grid (`LaunchpadGroupView.titleEditorView`, `#0x158`)
+    @Published public var inlineRenamingGroupID: String? = nil
+    /// In-place title editor target inside an opened folder
+    @Published public var inlineRenamingFolderAppID: String? = nil
+    /// Status toast message (`LaunchpadContentView.showStatusMessage`, `0x10010f7c4`)
+    @Published public var statusToastMessage: String? = nil
+    private var statusToastWorkItem: DispatchWorkItem? = nil
+
+    public func showStatusToast(_ message: String, duration: TimeInterval = 2.2) {
+        statusToastWorkItem?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            statusToastMessage = message
+        }
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                self?.statusToastMessage = nil
+            }
+        }
+        statusToastWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
 
     public let defaultSystemDirectories: [(String, AppSourceType)] = [
         ("/Applications", .system),
@@ -477,16 +499,40 @@ public final class ApplicationManager: ObservableObject {
         applyFilterAndSort()
     }
 
+    /// Normalizes page indices and per-page order while cascading any items exceeding `pageCapacity` (`cols * rows`)
+    /// to the front of `page + 1` recursively (replicates `LaunchpadDataManager` overflow cascade at `0x100085418`–`0x100087400`).
     private func normalizePagesAndOrders(_ groups: [LaunchpadGroup]) -> [LaunchpadGroup] {
+        let cap = max(1, AppState.shared.pageCapacity)
         let distinctPages = Array(Set(groups.map { $0.page })).sorted()
-        var result: [LaunchpadGroup] = []
-        for (newPageIdx, oldPage) in distinctPages.enumerated() {
-            let pageItems = groups
+        var pageBuckets: [[LaunchpadGroup]] = distinctPages.map { oldPage in
+            groups
                 .filter { $0.page == oldPage }
                 .sorted { $0.order < $1.order }
-            for (orderIdx, var item) in pageItems.enumerated() {
+        }
+
+        // Cascade overflow items from page `p` to the front of page `p + 1`
+        var p = 0
+        while p < pageBuckets.count {
+            if pageBuckets[p].count > cap {
+                let overflow = Array(pageBuckets[p].dropFirst(cap))
+                pageBuckets[p] = Array(pageBuckets[p].prefix(cap))
+                if p + 1 < pageBuckets.count {
+                    pageBuckets[p + 1].insert(contentsOf: overflow, at: 0)
+                } else {
+                    pageBuckets.append(overflow)
+                }
+            }
+            p += 1
+        }
+
+        var result: [LaunchpadGroup] = []
+        for (newPageIdx, bucket) in pageBuckets.enumerated() where !bucket.isEmpty {
+            for (orderIdx, var item) in bucket.enumerated() {
                 item.page = newPageIdx
                 item.order = orderIdx
+                for aIdx in item.apps.indices {
+                    item.apps[aIdx].order = aIdx
+                }
                 if !item.isFolder, let first = item.apps.first {
                     item.name = first.displayName
                 }
@@ -789,43 +835,111 @@ public final class ApplicationManager: ObservableObject {
 
     // MARK: - Interactive Operations (Move, Folder, Hide, Rename, Reorganize)
 
-    public func moveGroup(draggedID: String, toTargetID targetID: String, mergeIntoFolder: Bool = false) {
+    /// Reorders `draggedID` before or after `targetID` (replicates `LaunchpadContentView` live slot shift & drop commit at `0x10010c3d8`–`0x100114954`).
+    public func reorderGroup(draggedID: String, targetID: String, insertAfter: Bool = false, save: Bool = true) {
         guard draggedID != targetID else { return }
         guard let sourceIdx = allGroups.firstIndex(where: { $0.id == draggedID }),
               let targetIdx = allGroups.firstIndex(where: { $0.id == targetID }) else { return }
 
-        if mergeIntoFolder {
-            let sourceGroup = allGroups[sourceIdx]
-            var targetGroup = allGroups[targetIdx]
-            let combinedApps = targetGroup.apps + sourceGroup.apps
-            targetGroup.isFolder = true
-            if !allGroups[targetIdx].isFolder {
-                targetGroup.name = suggestFolderName(for: combinedApps)
-            }
-            targetGroup.apps = combinedApps
-            allGroups[targetIdx] = targetGroup
-            allGroups.remove(at: sourceIdx)
-        } else {
-            let targetPage = allGroups[targetIdx].page
-            let targetOrder = allGroups[targetIdx].order
-            var dragged = allGroups.remove(at: sourceIdx)
-            dragged.page = targetPage
-            dragged.order = targetOrder
+        let targetPage = allGroups[targetIdx].page
+        var dragged = allGroups.remove(at: sourceIdx)
+        dragged.page = targetPage
 
-            // Re-insert on targetPage at targetOrder
-            var pageItems = allGroups.filter { $0.page == targetPage }.sorted { $0.order < $1.order }
-            let insertAt = min(max(0, targetOrder), pageItems.count)
+        var pageItems = allGroups
+            .filter { $0.page == targetPage }
+            .sorted { $0.order < $1.order }
+
+        let maxSlotInPage = max(0, AppState.shared.pageCapacity - 1)
+        if let targetPosInPage = pageItems.firstIndex(where: { $0.id == targetID }) {
+            let rawInsert = insertAfter ? targetPosInPage + 1 : targetPosInPage
+            let insertAt = min(max(0, rawInsert), min(pageItems.count, maxSlotInPage))
             pageItems.insert(dragged, at: insertAt)
-            for (i, _) in pageItems.enumerated() {
-                pageItems[i].order = i
-            }
-            allGroups.removeAll { $0.page == targetPage }
-            allGroups.append(contentsOf: pageItems)
+        } else {
+            let insertAt = min(pageItems.count, maxSlotInPage)
+            pageItems.insert(dragged, at: insertAt)
         }
+
+        for i in pageItems.indices {
+            pageItems[i].order = i
+        }
+        allGroups.removeAll { $0.page == targetPage }
+        allGroups.append(contentsOf: pageItems)
+
+        allGroups = normalizePagesAndOrders(allGroups)
+        if save {
+            saveLayoutToCoreData()
+        }
+        applyFilterAndSort()
+    }
+
+    /// Moves `draggedID` onto `targetPage` (at `preferredSlotIndex` or the last slot on `targetPage`),
+    /// replicating `pendingDropAction == 3` `.moveToEnd` (`0x100113c98`) & cross-page edge transfer (`0x10011064c`–`0x1001124e4`).
+    /// When `targetPage` is already full (`count == pageCapacity`), inserts at `min(preferredSlotIndex, pageCapacity - 1)`
+    /// so `normalizePagesAndOrders` overflows the page's previous last item to `targetPage + 1` while keeping `dragged` on `targetPage`.
+    public func moveGroupToEndOfPage(draggedID: String, targetPage: Int, preferredSlotIndex: Int? = nil, save: Bool = true) {
+        guard let sourceIdx = allGroups.firstIndex(where: { $0.id == draggedID }) else { return }
+        var dragged = allGroups.remove(at: sourceIdx)
+        var pageItems = allGroups
+            .filter { $0.page == targetPage }
+            .sorted { $0.order < $1.order }
+        dragged.page = targetPage
+
+        let maxSlotInPage = max(0, AppState.shared.pageCapacity - 1)
+        let desiredSlot = preferredSlotIndex ?? pageItems.count
+        let insertAt = min(max(0, desiredSlot), min(pageItems.count, maxSlotInPage))
+        pageItems.insert(dragged, at: insertAt)
+
+        for i in pageItems.indices {
+            pageItems[i].order = i
+        }
+        allGroups.removeAll { $0.page == targetPage }
+        allGroups.append(contentsOf: pageItems)
+
+        allGroups = normalizePagesAndOrders(allGroups)
+        if save {
+            saveLayoutToCoreData()
+        }
+        applyFilterAndSort()
+    }
+
+    /// Merges one or more dragged groups into `targetID` (replicates `LaunchpadDataManager` merge & multi-drag folder creation at `0x10010c3d8` & `0x100145150`).
+    public func mergeGroups(draggedIDs: [String], intoTargetID targetID: String) {
+        let validSourceIDs = draggedIDs.filter { $0 != targetID }
+        guard !validSourceIDs.isEmpty,
+              let targetIdx = allGroups.firstIndex(where: { $0.id == targetID }) else { return }
+
+        let targetGroup = allGroups[targetIdx]
+        // Observed at `0x1001134a0`: Folders cannot merge into another group; only single-app groups merge
+        let sourceGroups = validSourceIDs.compactMap { id in
+            allGroups.first(where: { $0.id == id && !$0.isFolder })
+        }
+        let incomingApps = sourceGroups.flatMap { $0.apps }
+        guard !incomingApps.isEmpty else { return }
+
+        var updatedTarget = targetGroup
+        let combinedApps = updatedTarget.apps + incomingApps
+        if !updatedTarget.isFolder {
+            updatedTarget.isFolder = true
+            updatedTarget.name = suggestFolderName(for: combinedApps)
+        }
+        updatedTarget.apps = combinedApps
+        allGroups[targetIdx] = updatedTarget
+
+        let removedSet = Set(sourceGroups.map { $0.id })
+        allGroups.removeAll { removedSet.contains($0.id) }
+        selectedGroupIDs.removeAll()
 
         allGroups = normalizePagesAndOrders(allGroups)
         saveLayoutToCoreData()
         applyFilterAndSort()
+    }
+
+    public func moveGroup(draggedID: String, toTargetID targetID: String, mergeIntoFolder: Bool = false) {
+        if mergeIntoFolder {
+            mergeGroups(draggedIDs: [draggedID], intoTargetID: targetID)
+        } else {
+            reorderGroup(draggedID: draggedID, targetID: targetID, insertAfter: false, save: true)
+        }
     }
 
     public func createFolder(withGroupIDs ids: Set<String>, name: String? = nil) {
@@ -844,31 +958,57 @@ public final class ApplicationManager: ObservableObject {
             apps: apps
         )
 
-        allGroups.removeAll { ids.contains($0.id) }
-        allGroups.append(newFolder)
+        // Replace at `first`'s exact position on `first.page`
+        var pageItems = allGroups
+            .filter { $0.page == first.page }
+            .sorted { $0.order < $1.order }
+        let insertIndex = pageItems.firstIndex(where: { $0.id == first.id }) ?? pageItems.count
+        pageItems.removeAll { ids.contains($0.id) }
+        let clampedInsert = min(max(0, insertIndex), pageItems.count)
+        pageItems.insert(newFolder, at: clampedInsert)
+        for i in pageItems.indices {
+            pageItems[i].order = i
+        }
+
+        allGroups.removeAll { $0.page == first.page || ids.contains($0.id) }
+        allGroups.append(contentsOf: pageItems)
         allGroups = normalizePagesAndOrders(allGroups)
         selectedGroupIDs.removeAll()
         saveLayoutToCoreData()
         applyFilterAndSort()
     }
 
+    /// Replicates `LaunchpadDataManager.ungroupFolder` (`0x100089060` & `0x1001429c0`):
+    /// Replaces the folder at its exact slot on `folder.page` with its constituent apps in order, and cascades any page overflow.
     public func ungroupFolder(groupID: String) {
         guard let idx = allGroups.firstIndex(where: { $0.id == groupID }) else { return }
-        let folder = allGroups.remove(at: idx)
+        let folder = allGroups[idx]
         let basePage = folder.page
-        let maxOrderOnPage = allGroups.filter { $0.page == basePage }.map { $0.order }.max() ?? -1
 
-        for (offset, app) in folder.apps.enumerated() {
-            let single = LaunchpadGroup(
+        var pageItems = allGroups
+            .filter { $0.page == basePage }
+            .sorted { $0.order < $1.order }
+        let folderPos = pageItems.firstIndex(where: { $0.id == groupID }) ?? pageItems.count
+        pageItems.removeAll { $0.id == groupID }
+
+        let expandedSingles: [LaunchpadGroup] = folder.apps.enumerated().map { offset, app in
+            LaunchpadGroup(
                 id: UUID().uuidString,
                 name: app.displayName,
                 isFolder: false,
                 page: basePage,
-                order: maxOrderOnPage + 1 + offset,
+                order: folderPos + offset,
                 apps: [app]
             )
-            allGroups.append(single)
         }
+        let insertPos = min(max(0, folderPos), pageItems.count)
+        pageItems.insert(contentsOf: expandedSingles, at: insertPos)
+        for i in pageItems.indices {
+            pageItems[i].order = i
+        }
+
+        allGroups.removeAll { $0.page == basePage || $0.id == groupID }
+        allGroups.append(contentsOf: pageItems)
 
         if openedFolderID == groupID {
             openedFolderID = nil
@@ -878,11 +1018,67 @@ public final class ApplicationManager: ObservableObject {
         applyFilterAndSort()
     }
 
-    public func removeAppFromFolder(appID: String, folderID: String) {
-        guard let idx = allGroups.firstIndex(where: { $0.id == folderID }) else { return }
+    /// Reorders an app inside an opened folder (`openedFolderAppViews`, `0x10011a428`–`0x10011ab00`).
+    public func reorderAppInFolder(
+        folderID: String,
+        draggedAppID: String,
+        targetAppID: String,
+        insertAfter: Bool = false,
+        save: Bool = true
+    ) {
+        guard draggedAppID != targetAppID,
+              let fIdx = allGroups.firstIndex(where: { $0.id == folderID }) else { return }
+        var apps = allGroups[fIdx].apps
+        guard let srcIdx = apps.firstIndex(where: { $0.id == draggedAppID }) else { return }
+        let movedApp = apps.remove(at: srcIdx)
+        if let dstIdx = apps.firstIndex(where: { $0.id == targetAppID }) {
+            let insertAt = min(max(0, insertAfter ? dstIdx + 1 : dstIdx), apps.count)
+            apps.insert(movedApp, at: insertAt)
+        } else {
+            apps.append(movedApp)
+        }
+        for i in apps.indices {
+            apps[i].order = i
+        }
+        allGroups[fIdx].apps = apps
+        if save {
+            saveLayoutToCoreData()
+        }
+        applyFilterAndSort()
+    }
+
+    /// Moves an app to the end of an opened folder (`pendingDropAction == 3` inside opened folder at `0x10010d830`).
+    public func moveAppToEndOfFolder(folderID: String, draggedAppID: String, save: Bool = true) {
+        guard let fIdx = allGroups.firstIndex(where: { $0.id == folderID }) else { return }
+        var apps = allGroups[fIdx].apps
+        guard let srcIdx = apps.firstIndex(where: { $0.id == draggedAppID }) else { return }
+        let movedApp = apps.remove(at: srcIdx)
+        apps.append(movedApp)
+        for i in apps.indices {
+            apps[i].order = i
+        }
+        allGroups[fIdx].apps = apps
+        if save {
+            saveLayoutToCoreData()
+        }
+        applyFilterAndSort()
+    }
+
+    /// Detaches an app from `folderID` onto the main grid (replicates `0x10011abdc`–`0x10011b584`),
+    /// auto-dissolving the folder if `<= 1` app remains, and returning the newly created single-app `LaunchpadGroup`.
+    @discardableResult
+    public func detachAppFromFolder(
+        appID: String,
+        folderID: String,
+        targetPage: Int? = nil,
+        targetOrder: Int? = nil,
+        save: Bool = true
+    ) -> LaunchpadGroup? {
+        guard let idx = allGroups.firstIndex(where: { $0.id == folderID }) else { return nil }
         var folder = allGroups[idx]
-        guard let appIdx = folder.apps.firstIndex(where: { $0.id == appID }) else { return }
+        guard let appIdx = folder.apps.firstIndex(where: { $0.id == appID }) else { return nil }
         let removedApp = folder.apps.remove(at: appIdx)
+        let destPage = targetPage ?? folder.page
 
         if folder.apps.isEmpty {
             allGroups.remove(at: idx)
@@ -893,23 +1089,65 @@ public final class ApplicationManager: ObservableObject {
             allGroups[idx] = folder
             if openedFolderID == folderID { openedFolderID = nil }
         } else {
+            for i in folder.apps.indices {
+                folder.apps[i].order = i
+            }
             allGroups[idx] = folder
         }
 
-        let maxOrder = allGroups.filter { $0.page == folder.page }.map { $0.order }.max() ?? -1
-        allGroups.append(
-            LaunchpadGroup(
-                id: UUID().uuidString,
-                name: removedApp.displayName,
-                isFolder: false,
-                page: folder.page,
-                order: maxOrder + 1,
-                apps: [removedApp]
-            )
+        var pageItems = allGroups
+            .filter { $0.page == destPage }
+            .sorted { $0.order < $1.order }
+
+        let defaultInsertOrder: Int
+        if let folderPos = pageItems.firstIndex(where: { $0.id == folderID }) {
+            defaultInsertOrder = folderPos + 1
+        } else {
+            defaultInsertOrder = pageItems.count
+        }
+        let insertAt = min(max(0, targetOrder ?? defaultInsertOrder), pageItems.count)
+
+        let newGroup = LaunchpadGroup(
+            id: UUID().uuidString,
+            name: removedApp.displayName,
+            isFolder: false,
+            page: destPage,
+            order: insertAt,
+            apps: [removedApp]
         )
+        pageItems.insert(newGroup, at: insertAt)
+        for i in pageItems.indices {
+            pageItems[i].order = i
+        }
+        allGroups.removeAll { $0.page == destPage }
+        allGroups.append(contentsOf: pageItems)
+
         allGroups = normalizePagesAndOrders(allGroups)
-        saveLayoutToCoreData()
+        if save {
+            saveLayoutToCoreData()
+        }
         applyFilterAndSort()
+        return allGroups.first(where: { $0.id == newGroup.id }) ?? newGroup
+    }
+
+    public func removeAppFromFolder(appID: String, folderID: String) {
+        _ = detachAppFromFolder(appID: appID, folderID: folderID, save: true)
+    }
+
+    /// Moves an app from inside `folderID` directly to `targetPage` (`LaunchpadAppView.moveToPage:` when inside folder).
+    public func moveFolderAppToPage(appID: String, folderID: String, targetPage: Int) {
+        if openedFolderID == folderID {
+            openedFolderID = nil
+        }
+        _ = detachAppFromFolder(appID: appID, folderID: folderID, targetPage: targetPage, targetOrder: Int.max, save: true)
+    }
+
+    /// Moves an app from inside `sourceFolderID` into `targetFolderID` (`LaunchpadAppView.moveToFolder:` when inside folder).
+    public func moveFolderAppToAnotherFolder(appID: String, sourceFolderID: String, targetFolderID: String) {
+        guard sourceFolderID != targetFolderID else { return }
+        if let detached = detachAppFromFolder(appID: appID, folderID: sourceFolderID, save: false) {
+            mergeGroups(draggedIDs: [detached.id], intoTargetID: targetFolderID)
+        }
     }
 
     public func renameGroup(groupID: String, newName: String) {
@@ -920,6 +1158,16 @@ public final class ApplicationManager: ObservableObject {
         if !allGroups[idx].isFolder, !allGroups[idx].apps.isEmpty {
             allGroups[idx].apps[0].alias = trimmed
         }
+        saveLayoutToCoreData()
+        applyFilterAndSort()
+    }
+
+    public func renameAppInFolder(folderID: String, appID: String, newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let fIdx = allGroups.firstIndex(where: { $0.id == folderID }),
+              let aIdx = allGroups[fIdx].apps.firstIndex(where: { $0.id == appID }) else { return }
+        allGroups[fIdx].apps[aIdx].alias = trimmed
         saveLayoutToCoreData()
         applyFilterAndSort()
     }
@@ -945,6 +1193,14 @@ public final class ApplicationManager: ObservableObject {
         applyFilterAndSort()
     }
 
+    public func hideApps(inGroupIDs ids: Set<String>) {
+        let appsToHide = allGroups.filter { ids.contains($0.id) }.flatMap { $0.apps }
+        for app in appsToHide {
+            hideApp(app)
+        }
+        selectedGroupIDs.removeAll()
+    }
+
     public func unhideApp(_ app: LaunchpadApp) {
         hiddenApps.removeAll { $0.id == app.id }
         var visible = app
@@ -968,15 +1224,34 @@ public final class ApplicationManager: ObservableObject {
     }
 
     public func moveGroupToPage(_ groupID: String, targetPage: Int) {
-        guard let idx = allGroups.firstIndex(where: { $0.id == groupID }) else { return }
-        var grp = allGroups.remove(at: idx)
-        let maxOrder = (allGroups.filter { $0.page == targetPage }.map { $0.order }.max() ?? -1) + 1
-        grp.page = targetPage
-        grp.order = maxOrder
-        allGroups.append(grp)
+        moveItemsToPage(groupIDs: [groupID], targetPage: targetPage)
+    }
+
+    /// Moves one or more groups to `targetPage` (`LaunchpadContentView+MultiDrag.moveSelectedItemsToPage:` at `0x100145150`).
+    public func moveItemsToPage(groupIDs: [String], targetPage: Int) {
+        let idSet = Set(groupIDs)
+        let moving = allGroups
+            .filter { idSet.contains($0.id) }
+            .sorted { ($0.page, $0.order) < ($1.page, $1.order) }
+        guard !moving.isEmpty else { return }
+
+        allGroups.removeAll { idSet.contains($0.id) }
+        var maxOrder = (allGroups.filter { $0.page == targetPage }.map { $0.order }.max() ?? -1) + 1
+        for var grp in moving {
+            grp.page = targetPage
+            grp.order = maxOrder
+            maxOrder += 1
+            allGroups.append(grp)
+        }
+        selectedGroupIDs.removeAll()
         allGroups = normalizePagesAndOrders(allGroups)
         saveLayoutToCoreData()
         applyFilterAndSort()
+    }
+
+    /// Moves one or more groups' apps into `targetFolderID` (`LaunchpadContentView+MultiDrag.moveSelectedItemsToFolder:` at `0x100145150`).
+    public func moveAppsToFolder(groupIDs: [String], targetFolderID: String) {
+        mergeGroups(draggedIDs: groupIDs, intoTargetID: targetFolderID)
     }
 
     public func reorganizeLayout(with rules: ReorganizeRules) {

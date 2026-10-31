@@ -860,17 +860,21 @@ public final class ScrollWheelInterceptingHostingView<Content: View>: NSHostingV
                 if accumulatedDelta < -triggerThreshold && state.currentPage < totalPages - 1 {
                     gestureHasTurnedPage = true
                     pager.isDragging = false
+                    let nextPage = state.currentPage + 1
                     withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
                         pager.dragOffset = 0
-                        state.currentPage += 1
+                        state.currentPage = nextPage
                     }
+                    LaunchpadDragSession.shared.handlePageSwitchDuringDrag(to: nextPage)
                 } else if accumulatedDelta > triggerThreshold && state.currentPage > 0 {
                     gestureHasTurnedPage = true
                     pager.isDragging = false
+                    let nextPage = state.currentPage - 1
                     withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
                         pager.dragOffset = 0
-                        state.currentPage -= 1
+                        state.currentPage = nextPage
                     }
+                    LaunchpadDragSession.shared.handlePageSwitchDuringDrag(to: nextPage)
                 }
 
             case .ended, .cancelled:
@@ -884,10 +888,14 @@ public final class ScrollWheelInterceptingHostingView<Content: View>: NSHostingV
                     } else {
                         targetPage = state.currentPage
                     }
+                    let didChange = (targetPage != state.currentPage)
                     pager.isDragging = false
                     withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
                         pager.dragOffset = 0
                         state.currentPage = targetPage
+                    }
+                    if didChange {
+                        LaunchpadDragSession.shared.handlePageSwitchDuringDrag(to: targetPage)
                     }
                 }
                 accumulatedDelta = 0
@@ -904,14 +912,18 @@ public final class ScrollWheelInterceptingHostingView<Content: View>: NSHostingV
                 : event.scrollingDeltaY
             if delta < -0.3 && state.currentPage < totalPages - 1 {
                 lastDiscreteTurnTime = Date()
+                let nextPage = state.currentPage + 1
                 withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
-                    state.currentPage += 1
+                    state.currentPage = nextPage
                 }
+                LaunchpadDragSession.shared.handlePageSwitchDuringDrag(to: nextPage)
             } else if delta > 0.3 && state.currentPage > 0 {
                 lastDiscreteTurnTime = Date()
+                let nextPage = state.currentPage - 1
                 withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
-                    state.currentPage -= 1
+                    state.currentPage = nextPage
                 }
+                LaunchpadDragSession.shared.handlePageSwitchDuringDrag(to: nextPage)
             }
         }
     }
@@ -937,14 +949,951 @@ public struct VisualEffectBackground: NSViewRepresentable {
     }
 }
 
+/// Interactive Drag, Reorder, Folder Merge, Folder Detach, and Marquee Selection Engine
+/// Replicates `LaunchpadContentView` (`0x100105100`–`0x10011c500`), `LaunchpadContentView+MultiDrag` (`0x100140000`–`0x100148000`),
+/// and `LaunchpadDragPreviewView` (`0x100145cf0`–`0x10014a500`).
+public final class LaunchpadDragSession: ObservableObject {
+    public static let shared = LaunchpadDragSession()
+
+    /// Main-grid group cell frames in `"LaunchpadRootSpace"`
+    public var cellFrames: [String: CGRect] = [:]
+    /// Folder cell icon frames in `"LaunchpadRootSpace"` for `0.28s` open/close hero morph (`openedFolderSourceFrames`)
+    public var folderIconFrames: [String: CGRect] = [:]
+    /// Last known source rect for the currently opened or closing folder
+    @Published public var lastOpenedFolderSourceRect: CGRect? = nil
+    /// Opened folder glass card frame in `"LaunchpadRootSpace"` (`openedFolderClipView`)
+    public var openedFolderCardFrame: CGRect = .zero
+    /// App cell frames inside the opened folder in `"LaunchpadRootSpace"`
+    public var openedFolderAppFrames: [String: CGRect] = [:]
+    /// Current container size for edge page-flip detection & mathematical slot calculation
+    public var containerSize: CGSize = .zero
+
+    /// Press feedback state (`isPressed`, `0.8` alpha at `0x10015b73c`)
+    @Published public var pressedItemID: String? = nil
+    /// Active drag state (`isDragging`)
+    @Published public var isDragging: Bool = false
+    /// Drop commit flight animation state (`0x10010c3d8`–`0x10010d7c8`)
+    @Published public var isCommittingDrop: Bool = false
+    @Published public var dropCommitScale: CGFloat = 1.0
+
+    /// IDs of main-grid groups being dragged (single or multi-drag stack)
+    @Published public var draggedGroupIDs: [String] = []
+    /// Preview groups rendered in `LaunchpadDragPreviewOverlay`
+    @Published public var dragPreviewGroups: [LaunchpadGroup] = []
+    /// Non-nil when dragging an app inside an opened folder (`0x10011a428`)
+    @Published public var draggedFolderID: String? = nil
+    @Published public var draggedFolderApp: LaunchpadApp? = nil
+
+    /// Current pointer position in `"LaunchpadRootSpace"`
+    @Published public var cursorLocation: CGPoint = .zero
+    /// Hover merge target group ID (`isDraggingMerge` at `0x1000f92b0` & `0x100153cac`)
+    @Published public var mergeTargetGroupID: String? = nil
+    /// Live incoming app for 3x3 folder preview (`incomingDropAppID` at `0x100154860`)
+    @Published public var incomingDropApp: LaunchpadApp? = nil
+    /// Screen edge auto-paging direction (`-1` left, `0` none, `+1` right)
+    @Published public var activeEdgeDirection: Int = 0
+
+    /// Rubber-band marquee selection (`SelectionMarqueeView` at `0x100140000`)
+    @Published public var isMarqueeSelecting: Bool = false
+    @Published public var marqueeStartPoint: CGPoint = .zero
+    @Published public var marqueeCurrentPoint: CGPoint = .zero
+
+    private var longPressWorkItem: DispatchWorkItem? = nil
+    private var reorderHoverWorkItem: DispatchWorkItem? = nil
+    private var mergeHoverWorkItem: DispatchWorkItem? = nil
+    private var edgeFlipWorkItem: DispatchWorkItem? = nil
+    private var lastReorderTargetKey: String? = nil
+    private var pendingMergeCandidateID: String? = nil
+
+    /// Window-level mouse continuation state so cross-page moves and folder detaches never cancel an active drag
+    private var localMouseMonitor: Any? = nil
+    private var activePressGroup: LaunchpadGroup? = nil
+    private var activePressFolder: LaunchpadGroup? = nil
+    private var activePressFolderApp: LaunchpadApp? = nil
+    private var pressStartLocation: CGPoint = .zero
+
+    private init() {
+        installWindowMouseContinuationMonitor()
+    }
+
+    private func installWindowMouseContinuationMonitor() {
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            guard let self = self else { return event }
+            guard (self.isDragging || self.pressedItemID != nil), !self.isCommittingDrop else {
+                return event
+            }
+            guard self.containerSize.height > 0 else { return event }
+
+            // Convert NSWindow bottom-left coordinates into top-left `"LaunchpadRootSpace"` coordinates
+            let winPoint = event.locationInWindow
+            let rootPoint = CGPoint(x: winPoint.x, y: self.containerSize.height - winPoint.y)
+
+            switch event.type {
+            case .leftMouseDragged:
+                if self.isDragging {
+                    if self.draggedFolderID != nil,
+                       let folder = self.activePressFolder,
+                       let app = self.activePressFolderApp {
+                        self.updateFolderAppDrag(folder: folder, app: app, locationInRoot: rootPoint)
+                    } else if let group = self.activePressGroup ?? self.dragPreviewGroups.first {
+                        self.updateMainGridDrag(for: group, locationInRoot: rootPoint)
+                    }
+                } else if self.pressedItemID != nil {
+                    let dist = hypot(rootPoint.x - self.pressStartLocation.x, rootPoint.y - self.pressStartLocation.y)
+                    if dist > 4.0 {
+                        if let folder = self.activePressFolder, let app = self.activePressFolderApp {
+                            self.updateFolderAppDrag(folder: folder, app: app, locationInRoot: rootPoint)
+                        } else if let group = self.activePressGroup {
+                            self.updateMainGridDrag(for: group, locationInRoot: rootPoint)
+                        }
+                    }
+                }
+
+            case .leftMouseUp:
+                if self.isDragging {
+                    if self.draggedFolderID != nil {
+                        self.endFolderAppDrag()
+                    } else {
+                        self.endMainGridDrag()
+                    }
+                } else if self.pressedItemID != nil {
+                    self.cancelPress()
+                }
+
+            default:
+                break
+            }
+            return event
+        }
+    }
+
+    public var marqueeRect: CGRect {
+        CGRect(
+            x: min(marqueeStartPoint.x, marqueeCurrentPoint.x),
+            y: min(marqueeStartPoint.y, marqueeCurrentPoint.y),
+            width: abs(marqueeCurrentPoint.x - marqueeStartPoint.x),
+            height: abs(marqueeCurrentPoint.y - marqueeStartPoint.y)
+        )
+    }
+
+    public func isGroupHiddenAsPlaceholder(_ groupID: String) -> Bool {
+        guard isDragging && !isCommittingDrop else { return false }
+        return draggedGroupIDs.contains(groupID)
+    }
+
+    public func isFolderAppHiddenAsPlaceholder(_ appID: String) -> Bool {
+        guard isDragging && !isCommittingDrop else { return false }
+        return draggedFolderApp?.id == appID
+    }
+
+    // MARK: - Mathematical Main Grid Slot Geometry (`0x10010b33c`–`0x10010c3d0`)
+
+    public func mainGridMetrics() -> (cols: Int, rows: Int, topHeaderHeight: CGFloat, horizontalMargin: CGFloat, cellWidth: CGFloat, cellHeight: CGFloat) {
+        let state = AppState.shared
+        let cols = max(4, state.columnsPerPage)
+        let rows = max(3, state.rowsPerPage)
+        let isFullScreen = (state.displayMode == .fullScreen)
+        let topHeaderHeight: CGFloat = isFullScreen ? 106 : 80
+        let bottomFooterHeight: CGFloat = isFullScreen ? 84 : 64
+        let gridAreaHeight = max(320, containerSize.height - topHeaderHeight - bottomFooterHeight)
+        let horizontalMargin = round(max(48.0, containerSize.width * 0.085))
+        let usableWidth = max(400.0, containerSize.width - horizontalMargin * 2)
+        let cellWidth = usableWidth / CGFloat(cols)
+        let cellHeight = gridAreaHeight / CGFloat(rows)
+        return (cols, rows, topHeaderHeight, horizontalMargin, cellWidth, cellHeight)
+    }
+
+    public func mainGridSlotRect(forSlotIndex idx: Int) -> CGRect {
+        let m = mainGridMetrics()
+        let r = idx / m.cols
+        let c = idx % m.cols
+        return CGRect(
+            x: m.horizontalMargin + CGFloat(c) * m.cellWidth,
+            y: m.topHeaderHeight + CGFloat(r) * m.cellHeight,
+            width: m.cellWidth,
+            height: m.cellHeight
+        )
+    }
+
+    public func nearestMainGridSlotIndex(at point: CGPoint) -> Int {
+        let m = mainGridMetrics()
+        let col = min(max(0, Int(floor((point.x - m.horizontalMargin) / max(1.0, m.cellWidth)))), m.cols - 1)
+        let row = min(max(0, Int(floor((point.y - m.topHeaderHeight) / max(1.0, m.cellHeight)))), m.rows - 1)
+        return row * m.cols + col
+    }
+
+    // MARK: - Pointer Down & 0.55s Long-Press Jiggle Trigger (`0x10015d0b0`–`0x10015db44`)
+
+    public func beginPress(
+        itemID: String,
+        group: LaunchpadGroup? = nil,
+        folder: LaunchpadGroup? = nil,
+        folderApp: LaunchpadApp? = nil,
+        startLocation: CGPoint = .zero
+    ) {
+        if let group = group {
+            activePressGroup = group
+        }
+        if let folder = folder {
+            activePressFolder = folder
+        }
+        if let folderApp = folderApp {
+            activePressFolderApp = folderApp
+        }
+        if startLocation != .zero {
+            pressStartLocation = startLocation
+        }
+        guard pressedItemID != itemID, !isDragging else { return }
+        pressedItemID = itemID
+        longPressWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, !self.isDragging, self.pressedItemID == itemID else { return }
+            withAnimation(.spring(response: 0.26, dampingFraction: 0.68)) {
+                ApplicationManager.shared.isUninstallJiggleMode = true
+            }
+        }
+        longPressWorkItem = work
+        // Observed at `0x10015d238`: `0.55s` (`0x3fe199999999999a`) long press enters uninstall jiggle mode
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
+    }
+
+    public func cancelPress() {
+        longPressWorkItem?.cancel()
+        longPressWorkItem = nil
+        if pressedItemID != nil {
+            pressedItemID = nil
+        }
+    }
+
+    // MARK: - Cross-Page Transfer Helper (`0x10011064c`–`0x1001124e4`)
+
+    public func handlePageSwitchDuringDrag(to targetPage: Int) {
+        guard isDragging, !isCommittingDrop, draggedFolderID == nil, !draggedGroupIDs.isEmpty else { return }
+        let appManager = ApplicationManager.shared
+        reorderHoverWorkItem?.cancel()
+        mergeHoverWorkItem?.cancel()
+        lastReorderTargetKey = nil
+        pendingMergeCandidateID = nil
+        clearMergeTarget()
+
+        let preferredSlot = nearestMainGridSlotIndex(at: cursorLocation)
+        withAnimation(.easeInOut(duration: 0.36)) {
+            for (offset, id) in draggedGroupIDs.enumerated() {
+                appManager.moveGroupToEndOfPage(
+                    draggedID: id,
+                    targetPage: targetPage,
+                    preferredSlotIndex: preferredSlot + offset,
+                    save: false
+                )
+            }
+        }
+        refreshCurrentPageSlotFrames()
+    }
+
+    public func refreshCurrentPageSlotFrames() {
+        let state = AppState.shared
+        guard state.browsingStyle == .paged, containerSize.width > 200 else { return }
+        let pageGroups = ApplicationManager.shared.groups(forPage: state.currentPage)
+        for (idx, grp) in pageGroups.enumerated() {
+            let rect = mainGridSlotRect(forSlotIndex: idx)
+            cellFrames[grp.id] = rect
+            if grp.isFolder {
+                folderIconFrames[grp.id] = rect
+            }
+        }
+    }
+
+    // MARK: - Main Grid Drag Lifecycle
+
+    public func updateMainGridDrag(for group: LaunchpadGroup, locationInRoot: CGPoint) {
+        let appManager = ApplicationManager.shared
+        let state = AppState.shared
+
+        if !isDragging {
+            cancelPress()
+            // Observed at `0x10010f7c4`: Dragging is only allowed in `.custom` sort mode
+            guard state.sortBy == .custom, appManager.currentSearchQuery.isEmpty else {
+                appManager.showStatusToast("仅在“自定义”排序模式下支持拖拽调整位置")
+                return
+            }
+
+            activePressGroup = group
+            isDragging = true
+            isCommittingDrop = false
+            dropCommitScale = 1.06
+            cursorLocation = locationInRoot
+
+            if appManager.selectedGroupIDs.contains(group.id) && appManager.selectedGroupIDs.count > 1 {
+                let orderedSelected = appManager.allGroups
+                    .filter { appManager.selectedGroupIDs.contains($0.id) }
+                    .sorted { ($0.page, $0.order) < ($1.page, $1.order) }
+                // Put the actively grabbed group first in the fanned stack
+                var stacked = orderedSelected.filter { $0.id != group.id }
+                stacked.insert(group, at: 0)
+                draggedGroupIDs = stacked.map { $0.id }
+                dragPreviewGroups = stacked
+            } else {
+                appManager.selectedGroupIDs.removeAll()
+                draggedGroupIDs = [group.id]
+                dragPreviewGroups = [group]
+            }
+            refreshCurrentPageSlotFrames()
+            return
+        }
+
+        cursorLocation = locationInRoot
+        evaluateMainGridHover(at: locationInRoot)
+    }
+
+    public func endMainGridDrag() {
+        guard isDragging, !isCommittingDrop else {
+            if !isCommittingDrop {
+                cancelPress()
+            }
+            return
+        }
+        reorderHoverWorkItem?.cancel()
+        mergeHoverWorkItem?.cancel()
+        edgeFlipWorkItem?.cancel()
+        activeEdgeDirection = 0
+        lastReorderTargetKey = nil
+        pendingMergeCandidateID = nil
+
+        let appManager = ApplicationManager.shared
+        let state = AppState.shared
+        let primaryID = draggedGroupIDs.first
+
+        refreshCurrentPageSlotFrames()
+
+        // Determine target destination for smooth drop flight (`0x10010c3d8`–`0x10010d7c8`)
+        if let mergeTargetID = mergeTargetGroupID {
+            let targetRect = cellFrames[mergeTargetID]
+            isCommittingDrop = true
+            withAnimation(.easeInOut(duration: 0.24)) {
+                if let rect = targetRect {
+                    cursorLocation = CGPoint(x: rect.midX, y: rect.midY - 10)
+                }
+                dropCommitScale = 0.28
+            }
+            let idsToMerge = draggedGroupIDs
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    appManager.mergeGroups(draggedIDs: idsToMerge, intoTargetID: mergeTargetID)
+                }
+                self.resetDragState()
+            }
+        } else {
+            // Ensure primary dragged item is on `state.currentPage` if user switched pages before dropping
+            if state.browsingStyle == .paged,
+               let firstID = primaryID,
+               let firstGrp = appManager.allGroups.first(where: { $0.id == firstID }),
+               firstGrp.page != state.currentPage {
+                let preferredSlot = nearestMainGridSlotIndex(at: cursorLocation)
+                withAnimation(.easeInOut(duration: 0.36)) {
+                    appManager.moveGroupToEndOfPage(
+                        draggedID: firstID,
+                        targetPage: state.currentPage,
+                        preferredSlotIndex: preferredSlot,
+                        save: false
+                    )
+                }
+            }
+
+            // If multi-dragging > 1 items without merging, move all selected items next to the primary dragged item
+            if draggedGroupIDs.count > 1, let firstID = primaryID {
+                let otherIDs = Array(draggedGroupIDs.dropFirst())
+                for otherID in otherIDs.reversed() {
+                    appManager.reorderGroup(draggedID: otherID, targetID: firstID, insertAfter: true, save: false)
+                }
+            }
+            appManager.saveLayoutToCoreData()
+            refreshCurrentPageSlotFrames()
+
+            let resolvedRect: CGRect? = {
+                if let firstID = primaryID {
+                    if state.browsingStyle == .paged {
+                        let pageGroups = appManager.groups(forPage: state.currentPage)
+                        if let idx = pageGroups.firstIndex(where: { $0.id == firstID }) {
+                            return mainGridSlotRect(forSlotIndex: idx)
+                        }
+                    }
+                    return cellFrames[firstID]
+                }
+                return nil
+            }()
+
+            if let slotRect = resolvedRect {
+                isCommittingDrop = true
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    cursorLocation = CGPoint(x: slotRect.midX, y: slotRect.midY)
+                    dropCommitScale = 1.0
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+                    self.resetDragState()
+                }
+            } else {
+                resetDragState()
+            }
+        }
+    }
+
+    // MARK: - Opened Folder Inner App Drag & Detach Lifecycle (`0x10011a428`–`0x10011b708`)
+
+    public func updateFolderAppDrag(folder: LaunchpadGroup, app: LaunchpadApp, locationInRoot: CGPoint) {
+        let appManager = ApplicationManager.shared
+        let state = AppState.shared
+
+        if !isDragging {
+            cancelPress()
+            guard state.sortBy == .custom else {
+                appManager.showStatusToast("仅在“自定义”排序模式下支持拖拽调整位置")
+                return
+            }
+            activePressFolder = folder
+            activePressFolderApp = app
+            isDragging = true
+            isCommittingDrop = false
+            dropCommitScale = 1.06
+            cursorLocation = locationInRoot
+            draggedFolderID = folder.id
+            draggedFolderApp = app
+            dragPreviewGroups = [
+                LaunchpadGroup(
+                    id: "folder-drag-\(app.id)",
+                    name: app.displayName,
+                    isFolder: false,
+                    page: folder.page,
+                    order: app.order,
+                    apps: [app]
+                )
+            ]
+            return
+        }
+
+        cursorLocation = locationInRoot
+
+        // If already detached to the main grid during this drag session, evaluate main grid hover!
+        if draggedFolderID == nil && !draggedGroupIDs.isEmpty {
+            evaluateMainGridHover(at: locationInRoot)
+            return
+        }
+
+        guard let activeFolderID = draggedFolderID,
+              let activeApp = draggedFolderApp else { return }
+
+        // Check if cursor moved outside `openedFolderClipView` (`0x10011abdc`–`0x10011b584`)
+        let detachBounds = openedFolderCardFrame.insetBy(dx: -20, dy: -20)
+        if !openedFolderCardFrame.isEmpty && !detachBounds.contains(locationInRoot) {
+            reorderHoverWorkItem?.cancel()
+            lastReorderTargetKey = nil
+            // Detach app from folder, close folder overlay (`0.28s`), and continue dragging on main grid!
+            withAnimation(.easeInOut(duration: 0.28)) {
+                if let newGroup = appManager.detachAppFromFolder(
+                    appID: activeApp.id,
+                    folderID: activeFolderID,
+                    targetPage: state.currentPage,
+                    save: false
+                ) {
+                    self.draggedFolderID = nil
+                    self.draggedFolderApp = nil
+                    self.activePressGroup = newGroup
+                    self.draggedGroupIDs = [newGroup.id]
+                    self.dragPreviewGroups = [newGroup]
+                }
+                appManager.openedFolderID = nil
+            }
+            refreshCurrentPageSlotFrames()
+            return
+        }
+
+        // Otherwise, reorder inside the opened folder (`0x10011a428`–`0x10011ab00`)
+        evaluateOpenedFolderHover(folderID: activeFolderID, draggedAppID: activeApp.id, at: locationInRoot)
+    }
+
+    public func endFolderAppDrag() {
+        if draggedFolderID == nil && !draggedGroupIDs.isEmpty {
+            endMainGridDrag()
+            return
+        }
+        guard isDragging, !isCommittingDrop else {
+            if !isCommittingDrop {
+                cancelPress()
+            }
+            return
+        }
+        reorderHoverWorkItem?.cancel()
+        lastReorderTargetKey = nil
+        ApplicationManager.shared.saveLayoutToCoreData()
+
+        if let appID = draggedFolderApp?.id, let slotRect = openedFolderAppFrames[appID] {
+            isCommittingDrop = true
+            withAnimation(.easeInOut(duration: 0.20)) {
+                cursorLocation = CGPoint(x: slotRect.midX, y: slotRect.midY)
+                dropCommitScale = 1.0
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                self.resetDragState()
+            }
+        } else {
+            resetDragState()
+        }
+    }
+
+    // MARK: - Hit-Testing & Live Slot Shifting (`0.36s` `.easeInEaseOut`, `0x100111ac8`–`0x100114954`)
+
+    private func scheduleEdgePageFlip(direction: Int) {
+        edgeFlipWorkItem?.cancel()
+        guard direction != 0 else { return }
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.isDragging, !self.isCommittingDrop, self.activeEdgeDirection == direction else { return }
+            let appManager = ApplicationManager.shared
+            let state = AppState.shared
+            let currentGroups = appManager.groups(forPage: state.currentPage)
+            let canCreateTrailingPage = (direction > 0)
+                && (state.currentPage == appManager.totalPages - 1)
+                && (currentGroups.count > self.draggedGroupIDs.count)
+            let maxReachablePage = canCreateTrailingPage ? appManager.totalPages : (appManager.totalPages - 1)
+            let nextPage = max(0, min(maxReachablePage, state.currentPage + direction))
+
+            if nextPage != state.currentPage {
+                self.reorderHoverWorkItem?.cancel()
+                self.mergeHoverWorkItem?.cancel()
+                self.lastReorderTargetKey = nil
+                self.pendingMergeCandidateID = nil
+                self.clearMergeTarget()
+
+                let preferredSlot = self.nearestMainGridSlotIndex(at: self.cursorLocation)
+                withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                    for (offset, id) in self.draggedGroupIDs.enumerated() {
+                        appManager.moveGroupToEndOfPage(
+                            draggedID: id,
+                            targetPage: nextPage,
+                            preferredSlotIndex: preferredSlot + offset,
+                            save: false
+                        )
+                    }
+                    state.currentPage = min(nextPage, max(0, appManager.totalPages - 1))
+                }
+                self.refreshCurrentPageSlotFrames()
+
+                // Continue flipping across multiple pages if pointer remains held at the screen edge
+                let edgeMargin: CGFloat = 56.0
+                let stillInLeft = (direction < 0 && self.cursorLocation.x < edgeMargin && state.currentPage > 0)
+                let stillInRight = (direction > 0 && self.cursorLocation.x > self.containerSize.width - edgeMargin && state.currentPage < appManager.totalPages - 1)
+                if stillInLeft || stillInRight {
+                    self.scheduleEdgePageFlip(direction: direction)
+                } else {
+                    self.activeEdgeDirection = 0
+                }
+            } else {
+                self.activeEdgeDirection = 0
+            }
+        }
+        edgeFlipWorkItem = work
+        // Observed at `0x100112448`: edge hover page turn trigger
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+    }
+
+    private func evaluateMainGridHover(at point: CGPoint) {
+        guard let primaryDraggedID = draggedGroupIDs.first else { return }
+        let appManager = ApplicationManager.shared
+        let state = AppState.shared
+
+        let pageGroups = state.browsingStyle == .paged
+            ? appManager.groups(forPage: state.currentPage)
+            : appManager.filteredGroups
+
+        if state.browsingStyle == .paged {
+            refreshCurrentPageSlotFrames()
+        }
+
+        // 1. Screen-edge hover page flip (`0x10011064c`–`0x1001124e4`)
+        if state.browsingStyle == .paged && containerSize.width > 200 {
+            let edgeMargin: CGFloat = 56.0
+            let canFlipRight = (state.currentPage < appManager.totalPages - 1)
+                || (state.currentPage == appManager.totalPages - 1 && pageGroups.count > draggedGroupIDs.count)
+            let newEdgeDir: Int
+            if point.x < edgeMargin && state.currentPage > 0 {
+                newEdgeDir = -1
+            } else if point.x > containerSize.width - edgeMargin && canFlipRight {
+                newEdgeDir = 1
+            } else {
+                newEdgeDir = 0
+            }
+
+            if newEdgeDir != activeEdgeDirection {
+                activeEdgeDirection = newEdgeDir
+                scheduleEdgePageFlip(direction: newEdgeDir)
+            }
+            // While hovering inside the screen-edge page-turn strip, avoid firing edge-cell reorders
+            if newEdgeDir != 0 {
+                return
+            }
+        }
+
+        // 2. Hit-test target cells on current page (`0x100111ac8`–`0x100111bbc` & `0x10010f8f0`)
+        let draggedGroup = appManager.allGroups.first(where: { $0.id == primaryDraggedID })
+        let canMergeIntoTarget = !(draggedGroup?.isFolder ?? false) && draggedGroupIDs.allSatisfy { id in
+            !(appManager.allGroups.first(where: { $0.id == id })?.isFolder ?? false)
+        }
+
+        for (slotIdx, target) in pageGroups.enumerated() where !draggedGroupIDs.contains(target.id) {
+            let frame: CGRect
+            if state.browsingStyle == .paged && containerSize.width > 200 {
+                frame = mainGridSlotRect(forSlotIndex: slotIdx)
+            } else if let recorded = cellFrames[target.id] {
+                frame = recorded
+            } else {
+                continue
+            }
+
+            let hitRect = frame.insetBy(dx: -2, dy: -2)
+            guard hitRect.contains(point) else { continue }
+
+            // Replicate `LaunchpadContentView` (`0x100111b4c`–`0x100111bbc`):
+            // Each cell has an inner `96x96` `iconView` centered horizontally in `cellWidth`.
+            // - Center core of `iconView` (`±26pt` horizontally, within icon vertical bounds): `.mergeIntoFolder` (`action = 2`)
+            // - Left of center (`point.x < frame.midX`) outside merge core: `.moveBefore` (`action = 0`)
+            // - Right of center (`point.x >= frame.midX`) outside merge core: `.moveAfter` (`action = 1`)
+            let dxFromCenter = point.x - frame.midX
+            let iconTopY = frame.minY + max(6.0, (frame.height - 122.0) * 0.5)
+            let iconBottomY = iconTopY + 96.0
+            let isInsideIconMergeCore = canMergeIntoTarget
+                && abs(dxFromCenter) <= 26.0
+                && point.y >= iconTopY + 10.0
+                && point.y <= iconBottomY - 8.0
+
+            if isInsideIconMergeCore {
+                reorderHoverWorkItem?.cancel()
+                lastReorderTargetKey = nil
+                if mergeTargetGroupID != target.id && pendingMergeCandidateID != target.id {
+                    pendingMergeCandidateID = target.id
+                    mergeHoverWorkItem?.cancel()
+                    let mergeWork = DispatchWorkItem { [weak self] in
+                        guard let self = self, self.isDragging, self.pendingMergeCandidateID == target.id else { return }
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            self.mergeTargetGroupID = target.id
+                            self.incomingDropApp = self.dragPreviewGroups.first?.primaryApp
+                        }
+                    }
+                    mergeHoverWorkItem = mergeWork
+                    // Observed at `0x10010f8f0`: `0.10s` (`0x3fb999999999999a`) dwell before activating merge target
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10, execute: mergeWork)
+                }
+                return
+            } else {
+                mergeHoverWorkItem?.cancel()
+                pendingMergeCandidateID = nil
+                clearMergeTarget()
+
+                let insertAfter = dxFromCenter >= 0
+                let key = "\(target.id)-\(insertAfter ? "after" : "before")"
+                if lastReorderTargetKey != key {
+                    lastReorderTargetKey = key
+                    reorderHoverWorkItem?.cancel()
+                    let work = DispatchWorkItem { [weak self] in
+                        guard let self = self, self.isDragging else { return }
+                        // Observed at `0x10010d830`: `0.36s` `CAMediaTimingFunction(name: .easeInEaseOut)`
+                        withAnimation(.easeInOut(duration: 0.36)) {
+                            appManager.reorderGroup(
+                                draggedID: primaryDraggedID,
+                                targetID: target.id,
+                                insertAfter: insertAfter,
+                                save: false
+                            )
+                        }
+                        self.refreshCurrentPageSlotFrames()
+                    }
+                    reorderHoverWorkItem = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+                }
+                return
+            }
+        }
+
+        // Not hovering any cell: clear merge target and check `.moveToEnd` (`pendingDropAction == 3`, `0x100113c98`)
+        mergeHoverWorkItem?.cancel()
+        pendingMergeCandidateID = nil
+        clearMergeTarget()
+
+        if let lastIdx = pageGroups.indices.last {
+            let lastGroup = pageGroups[lastIdx]
+            let lastFrame = (state.browsingStyle == .paged && containerSize.width > 200)
+                ? mainGridSlotRect(forSlotIndex: lastIdx)
+                : (cellFrames[lastGroup.id] ?? .zero)
+
+            if lastGroup.id != primaryDraggedID && !lastFrame.isEmpty {
+                let isAfterLast = (point.y > lastFrame.maxY) || (point.y >= lastFrame.minY && point.x > lastFrame.maxX + 12)
+                if isAfterLast {
+                    let key = "moveToEnd-\(state.currentPage)"
+                    if lastReorderTargetKey != key {
+                        lastReorderTargetKey = key
+                        reorderHoverWorkItem?.cancel()
+                        let work = DispatchWorkItem { [weak self] in
+                            guard let self = self, self.isDragging else { return }
+                            withAnimation(.easeInOut(duration: 0.36)) {
+                                appManager.moveGroupToEndOfPage(
+                                    draggedID: primaryDraggedID,
+                                    targetPage: state.currentPage,
+                                    save: false
+                                )
+                            }
+                            self.refreshCurrentPageSlotFrames()
+                        }
+                        reorderHoverWorkItem = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10, execute: work)
+                    }
+                }
+            }
+        } else if state.browsingStyle == .paged {
+            // Empty page: move dragged group onto this page immediately
+            let key = "moveToEmptyPage-\(state.currentPage)"
+            if lastReorderTargetKey != key {
+                lastReorderTargetKey = key
+                withAnimation(.easeInOut(duration: 0.36)) {
+                    appManager.moveGroupToEndOfPage(
+                        draggedID: primaryDraggedID,
+                        targetPage: state.currentPage,
+                        save: false
+                    )
+                }
+                refreshCurrentPageSlotFrames()
+            }
+        }
+    }
+
+    private func evaluateOpenedFolderHover(folderID: String, draggedAppID: String, at point: CGPoint) {
+        let appManager = ApplicationManager.shared
+        guard let folder = appManager.allGroups.first(where: { $0.id == folderID }) else { return }
+
+        for targetApp in folder.apps where targetApp.id != draggedAppID {
+            guard let frame = openedFolderAppFrames[targetApp.id] else { continue }
+            guard frame.insetBy(dx: -4, dy: -4).contains(point) else { continue }
+            let insertAfter = (point.x - frame.minX) > frame.width * 0.5
+            let key = "folder-\(targetApp.id)-\(insertAfter)"
+            if lastReorderTargetKey != key {
+                lastReorderTargetKey = key
+                reorderHoverWorkItem?.cancel()
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self = self, self.isDragging else { return }
+                    withAnimation(.easeInOut(duration: 0.36)) {
+                        appManager.reorderAppInFolder(
+                            folderID: folderID,
+                            draggedAppID: draggedAppID,
+                            targetAppID: targetApp.id,
+                            insertAfter: insertAfter,
+                            save: false
+                        )
+                    }
+                }
+                reorderHoverWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+            }
+            return
+        }
+
+        // Check `.moveToEnd` inside folder (`0x10010d830`)
+        if let lastApp = folder.apps.last,
+           lastApp.id != draggedAppID,
+           let lastFrame = openedFolderAppFrames[lastApp.id] {
+            if point.y > lastFrame.maxY || (point.y >= lastFrame.minY && point.x > lastFrame.maxX + 10) {
+                let key = "folder-moveToEnd"
+                if lastReorderTargetKey != key {
+                    lastReorderTargetKey = key
+                    reorderHoverWorkItem?.cancel()
+                    let work = DispatchWorkItem { [weak self] in
+                        guard let self = self, self.isDragging else { return }
+                        withAnimation(.easeInOut(duration: 0.36)) {
+                            appManager.moveAppToEndOfFolder(folderID: folderID, draggedAppID: draggedAppID, save: false)
+                        }
+                    }
+                    reorderHoverWorkItem = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10, execute: work)
+                }
+            }
+        }
+    }
+
+    // MARK: - Rubber-Band Marquee Selection (`SelectionMarqueeView`, `0x100140000`)
+
+    public func updateMarqueeSelection(start: CGPoint, current: CGPoint) {
+        let appManager = ApplicationManager.shared
+        guard appManager.openedFolderID == nil, !isDragging else { return }
+        if !isMarqueeSelecting {
+            isMarqueeSelecting = true
+            marqueeStartPoint = start
+        }
+        marqueeCurrentPoint = current
+        let rect = marqueeRect
+        let pageGroups = AppState.shared.browsingStyle == .paged
+            ? appManager.groups(forPage: AppState.shared.currentPage)
+            : appManager.filteredGroups
+
+        var selected = Set<String>()
+        for (idx, grp) in pageGroups.enumerated() {
+            let cellRect = (AppState.shared.browsingStyle == .paged && containerSize.width > 200)
+                ? mainGridSlotRect(forSlotIndex: idx)
+                : (cellFrames[grp.id] ?? .zero)
+            if !cellRect.isEmpty && rect.intersects(cellRect.insetBy(dx: 12, dy: 12)) {
+                selected.insert(grp.id)
+            }
+        }
+        appManager.selectedGroupIDs = selected
+    }
+
+    public func endMarqueeSelection() {
+        isMarqueeSelecting = false
+    }
+
+    private func clearMergeTarget() {
+        if mergeTargetGroupID != nil || incomingDropApp != nil {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                mergeTargetGroupID = nil
+                incomingDropApp = nil
+            }
+        }
+    }
+
+    public func resetDragState() {
+        reorderHoverWorkItem?.cancel()
+        mergeHoverWorkItem?.cancel()
+        edgeFlipWorkItem?.cancel()
+        longPressWorkItem?.cancel()
+        activeEdgeDirection = 0
+        lastReorderTargetKey = nil
+        pendingMergeCandidateID = nil
+        activePressGroup = nil
+        activePressFolder = nil
+        activePressFolderApp = nil
+        pressStartLocation = .zero
+        pressedItemID = nil
+        isDragging = false
+        isCommittingDrop = false
+        dropCommitScale = 1.0
+        draggedGroupIDs = []
+        dragPreviewGroups = []
+        draggedFolderID = nil
+        draggedFolderApp = nil
+        mergeTargetGroupID = nil
+        incomingDropApp = nil
+    }
+}
+
+/// Floating Drag Preview replicating `LaunchpadDragPreviewView`, `LaunchpadDragCardView`, and `LaunchpadDragCountBadge`
+/// (`0x100145cf0`–`0x10014a500`):
+/// - Lifts the dragged icon(s) at `0.85` opacity and `1.06x` scale
+/// - In multi-drag (`dragPreviewGroups.count > 1`), fans up to 5 cards with slight rotation/offset and shows a red capsule count badge
+public struct LaunchpadDragPreviewOverlay: View {
+    @ObservedObject var dragSession = LaunchpadDragSession.shared
+    @ObservedObject var state = AppState.shared
+
+    private let iconDimension: CGFloat = 96.0
+
+    public var body: some View {
+        let previewItems = Array(dragSession.dragPreviewGroups.prefix(5))
+        let totalCount = dragSession.dragPreviewGroups.count
+
+        ZStack(alignment: .topTrailing) {
+            ForEach(Array(previewItems.enumerated().reversed()), id: \.element.id) { index, grp in
+                let fanAngle: Double = index == 0 ? 0 : (index % 2 == 1 ? Double(index) * 4.5 : -Double(index) * 4.0)
+                let fanOffset = CGSize(
+                    width: CGFloat(index) * (index % 2 == 1 ? 6.0 : -5.0),
+                    height: -CGFloat(index) * 4.0
+                )
+                dragCardView(for: grp, isPrimary: index == 0 && totalCount == 1)
+                    .rotationEffect(.degrees(fanAngle))
+                    .offset(fanOffset)
+            }
+
+            // `LaunchpadDragCountBadge` (`0x100149800`) when multi-dragging > 1 items
+            if totalCount > 1 {
+                Text("\(totalCount)")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .frame(minWidth: 26, minHeight: 26)
+                    .background(
+                        Capsule()
+                            .fill(Color.red)
+                            .overlay(Capsule().stroke(Color.white, lineWidth: 1.8))
+                    )
+                    .shadow(color: .black.opacity(0.35), radius: 4, x: 0, y: 2)
+                    .offset(x: 6, y: -6)
+            }
+        }
+        .scaleEffect(dragSession.dropCommitScale)
+        .opacity(0.88)
+        .position(x: dragSession.cursorLocation.x, y: dragSession.cursorLocation.y)
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func dragCardView(for group: LaunchpadGroup, isPrimary: Bool) -> some View {
+        VStack(spacing: 8) {
+            if group.isFolder {
+                let boxSize = trunc(iconDimension * 0.81)
+                let d2 = round(max(4.0, boxSize * 0.26))
+                let cornerRadius = round((iconDimension - boxSize) * 0.5 + d2)
+                ZStack {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.white.opacity(0.24))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                                .stroke(Color.white.opacity(0.36), lineWidth: 1)
+                        )
+                        .frame(width: boxSize, height: boxSize)
+                        .shadow(color: .black.opacity(0.38), radius: 12, x: 0, y: 6)
+
+                    let previewApps = Array(group.apps.prefix(9))
+                    let miniSpacing: CGFloat = 3.0
+                    let miniSize = floor((boxSize * 0.78 - miniSpacing * 2) / 3.0)
+                    LazyVGrid(
+                        columns: Array(repeating: GridItem(.fixed(miniSize), spacing: miniSpacing), count: 3),
+                        alignment: .leading,
+                        spacing: miniSpacing
+                    ) {
+                        ForEach(previewApps) { app in
+                            Image(nsImage: AppIconRepository.shared.icon(for: app, pointSize: 48))
+                                .resizable()
+                                .interpolation(.high)
+                                .frame(width: miniSize, height: miniSize)
+                        }
+                    }
+                    .frame(
+                        width: miniSize * 3 + miniSpacing * 2,
+                        height: miniSize * 3 + miniSpacing * 2,
+                        alignment: .topLeading
+                    )
+                }
+                .frame(width: iconDimension, height: iconDimension)
+            } else if let app = group.primaryApp {
+                Image(nsImage: AppIconRepository.shared.icon(for: app))
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: iconDimension, height: iconDimension)
+                    .shadow(color: .black.opacity(0.42), radius: 14, x: 0, y: 8)
+            }
+
+            if isPrimary && !state.hideNames {
+                Text(group.name)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.65), radius: 2, x: 0, y: 1)
+                    .lineLimit(1)
+                    .frame(width: iconDimension + 16, height: 20)
+            }
+        }
+    }
+}
+
 /// Main Launchpad interactive interface replicating `LaunchpadContentView`, `LaunchpadAppView`, `LaunchpadFolderView`
 public struct LaunchpadRootView: View {
     @ObservedObject var state = AppState.shared
     @ObservedObject var appManager = ApplicationManager.shared
     @ObservedObject var pager = PagerInteractionState.shared
+    @ObservedObject var dragSession = LaunchpadDragSession.shared
     @FocusState private var isSearchFocused: Bool
-    @LocalState private var draggedGroupID: String? = nil
-    @LocalState private var dropTargetGroupID: String? = nil
 
     public var body: some View {
         GeometryReader { geo in
@@ -968,7 +1917,7 @@ public struct LaunchpadRootView: View {
                         handleBlankAreaTap()
                     }
 
-                // 2. Symmetrical Main Foreground Layout (1.0 <-> 1.05 scale + opacity fade matching original LaunchOS)
+                // 2. Symmetrical Main Foreground Layout (`0.94` scale + `0.001` opacity when folder is open, matching `0x100124dc8`)
                 VStack(spacing: 0) {
                     // Top Bar: Search Bar strictly centered in ZStack; controls symmetric on right
                     topBarView(width: geo.size.width, isFullScreen: isFullScreen)
@@ -1002,7 +1951,7 @@ public struct LaunchpadRootView: View {
                             )
                         }
 
-                        if !appManager.selectedGroupIDs.isEmpty {
+                        if !appManager.selectedGroupIDs.isEmpty && !dragSession.isDragging {
                             VStack {
                                 multiSelectToolbar
                                     .padding(.top, 4)
@@ -1022,24 +1971,105 @@ public struct LaunchpadRootView: View {
                 .allowsHitTesting(appManager.openedFolderID == nil)
                 .animation(.easeInOut(duration: 0.28), value: appManager.openedFolderID != nil)
 
-                // 5. Opened Folder Overlay (`LaunchpadContentView+Folder.swift` `0x10011c578`–`0x100128488`)
+                // 5. Rubber-band Marquee Selection Rectangle (`SelectionMarqueeView` at `0x100140000`)
+                if dragSession.isMarqueeSelecting {
+                    let mRect = dragSession.marqueeRect
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.18))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .stroke(Color.accentColor.opacity(0.75), lineWidth: 1.2)
+                        )
+                        .frame(width: mRect.width, height: mRect.height)
+                        .position(x: mRect.midX, y: mRect.midY)
+                        .allowsHitTesting(false)
+                        .zIndex(8)
+                }
+
+                // 6. Opened Folder Overlay (`LaunchpadContentView+Folder.swift` `0x10011c578`–`0x100128488`)
                 if let folderID = appManager.openedFolderID,
                    let folder = appManager.allGroups.first(where: { $0.id == folderID }) {
                     OpenedFolderOverlayView(
                         group: folder,
                         containerSize: geo.size,
-                        gridAreaHeight: gridAreaHeight
+                        gridAreaHeight: gridAreaHeight,
+                        sourceFolderRect: dragSession.folderIconFrames[folderID] ?? dragSession.lastOpenedFolderSourceRect
                     )
-                    .transition(.scale(scale: 0.88).combined(with: .opacity))
+                    .id(folderID)
                     .zIndex(10)
                 }
+
+                // 7. Floating Drag Preview (`LaunchpadDragPreviewView` `0x100145cf0`)
+                if dragSession.isDragging && !dragSession.dragPreviewGroups.isEmpty {
+                    LaunchpadDragPreviewOverlay()
+                        .zIndex(20)
+                }
+
+                // 7b. Screen-Edge Drag Page-Flip Indicator (`0x10011064c`–`0x1001124e4`)
+                if dragSession.isDragging && dragSession.activeEdgeDirection != 0 {
+                    HStack {
+                        if dragSession.activeEdgeDirection < 0 {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .fill(Color.white.opacity(0.14))
+                                    .frame(width: 36, height: 120)
+                                Image(systemName: "chevron.compact.left")
+                                    .font(.system(size: 28, weight: .semibold))
+                                    .foregroundColor(.white.opacity(0.85))
+                            }
+                            .padding(.leading, 10)
+                            .transition(.opacity.combined(with: .scale))
+                        }
+                        Spacer()
+                        if dragSession.activeEdgeDirection > 0 {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .fill(Color.white.opacity(0.14))
+                                    .frame(width: 36, height: 120)
+                                Image(systemName: "chevron.compact.right")
+                                    .font(.system(size: 28, weight: .semibold))
+                                    .foregroundColor(.white.opacity(0.85))
+                            }
+                            .padding(.trailing, 10)
+                            .transition(.opacity.combined(with: .scale))
+                        }
+                    }
+                    .allowsHitTesting(false)
+                    .animation(.easeInOut(duration: 0.18), value: dragSession.activeEdgeDirection)
+                    .zIndex(25)
+                }
+
+                // 8. Status Toast (`LaunchpadContentView.showStatusMessage` `0x10010f7c4`)
+                if let toast = appManager.statusToastMessage {
+                    VStack {
+                        Spacer()
+                        Text(toast)
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 10)
+                            .background(
+                                Capsule()
+                                    .fill(Color.black.opacity(0.68))
+                                    .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 0.8))
+                            )
+                            .shadow(color: .black.opacity(0.35), radius: 10, x: 0, y: 4)
+                            .padding(.bottom, bottomFooterHeight + 16)
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    .zIndex(30)
+                }
             }
+            .coordinateSpace(name: "LaunchpadRootSpace")
             .frame(width: geo.size.width, height: geo.size.height)
             .clipShape(RoundedRectangle(cornerRadius: isFullScreen ? 0 : 24, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: isFullScreen ? 0 : 24, style: .continuous)
                     .stroke(Color.white.opacity(isFullScreen ? 0 : 0.22), lineWidth: isFullScreen ? 0 : 1)
             )
+            .onChange(of: geo.size) { _, newSize in
+                dragSession.containerSize = newSize
+            }
             .onChange(of: pageCount) { _, newPageCount in
                 if state.currentPage >= newPageCount {
                     withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
@@ -1048,6 +2078,7 @@ public struct LaunchpadRootView: View {
                 }
             }
             .onAppear {
+                dragSession.containerSize = geo.size
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     isSearchFocused = true
                 }
@@ -1058,12 +2089,17 @@ public struct LaunchpadRootView: View {
 
     // MARK: - Blank Area Click Dismissal Handler
     private func handleBlankAreaTap() {
-        if appManager.openedFolderID != nil {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+        if appManager.inlineRenamingGroupID != nil || appManager.inlineRenamingFolderAppID != nil {
+            appManager.inlineRenamingGroupID = nil
+            appManager.inlineRenamingFolderAppID = nil
+        } else if appManager.openedFolderID != nil {
+            withAnimation(.easeInOut(duration: 0.28)) {
                 appManager.openedFolderID = nil
             }
         } else if appManager.isUninstallJiggleMode {
-            appManager.isUninstallJiggleMode = false
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.78)) {
+                appManager.isUninstallJiggleMode = false
+            }
         } else if !appManager.selectedGroupIDs.isEmpty {
             appManager.selectedGroupIDs.removeAll()
         } else {
@@ -1322,12 +2358,18 @@ public struct LaunchpadRootView: View {
         .simultaneousGesture(
             DragGesture(minimumDistance: 10)
                 .onChanged { value in
+                    guard !dragSession.isDragging,
+                          dragSession.pressedItemID == nil,
+                          !dragSession.isMarqueeSelecting else {
+                        return
+                    }
                     pager.isDragging = true
                     let atFirst = safePage <= 0 && value.translation.width > 0
                     let atLast = safePage >= pageCount - 1 && value.translation.width < 0
                     pager.dragOffset = value.translation.width * ((atFirst || atLast) ? 0.25 : 1.0)
                 }
                 .onEnded { value in
+                    guard pager.isDragging else { return }
                     pager.isDragging = false
                     let threshold: CGFloat = max(45.0, containerWidth * 0.05)
                     var nextPage = safePage
@@ -1346,8 +2388,10 @@ public struct LaunchpadRootView: View {
         )
     }
 
-    /// Renders an exact `rows × cols` matrix where every slot has identical `(cellWidth, cellHeight)`
-    /// and only the tight icon+label region inside each slot captures app clicks; all surrounding blank space exits LaunchOS.
+    /// Renders an exact `rows × cols` matrix where every slot has identical `(cellWidth, cellHeight)`.
+    /// Keying `ForEach` by stable `group.id` and positioning each cell at its mathematical `(centerX, centerY)`
+    /// replicates `LaunchpadContentView.layout(animated: true)` (`0.36s` `.easeInEaseOut` at `0x10010d830`),
+    /// so sibling icons smoothly glide in 2D space (horizontally within a row and diagonally across row boundaries).
     @ViewBuilder
     private func symmetricPageMatrix(
         pageGroups: [LaunchpadGroup],
@@ -1357,37 +2401,50 @@ public struct LaunchpadRootView: View {
         cellHeight: CGFloat,
         horizontalMargin: CGFloat
     ) -> some View {
+        let gridWidth = cellWidth * CGFloat(cols)
+        let gridHeight = cellHeight * CGFloat(rows)
+        let visibleGroups = Array(pageGroups.prefix(rows * cols))
+
         ZStack {
-            // Blank space in horizontal margins & between cells dismisses LaunchOS
+            // Blank space in horizontal margins & between cells dismisses LaunchOS or starts marquee selection
             Color.white.opacity(0.001)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     handleBlankAreaTap()
                 }
-
-            VStack(spacing: 0) {
-                ForEach(0..<rows, id: \.self) { r in
-                    HStack(spacing: 0) {
-                        ForEach(0..<cols, id: \.self) { c in
-                            let idx = r * cols + c
-                            ZStack(alignment: .center) {
-                                Color.white.opacity(0.001)
-                                    .frame(width: cellWidth, height: cellHeight)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        handleBlankAreaTap()
-                                    }
-
-                                if idx < pageGroups.count {
-                                    gridCell(for: pageGroups[idx])
-                                }
-                            }
-                            .frame(width: cellWidth, height: cellHeight)
+                .gesture(
+                    DragGesture(minimumDistance: 6, coordinateSpace: .named("LaunchpadRootSpace"))
+                        .onChanged { value in
+                            dragSession.updateMarqueeSelection(start: value.startLocation, current: value.location)
                         }
+                        .onEnded { _ in
+                            dragSession.endMarqueeSelection()
+                        }
+                )
+
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(visibleGroups.enumerated()), id: \.element.id) { idx, group in
+                    let r = idx / cols
+                    let c = idx % cols
+                    let centerX = (CGFloat(c) + 0.5) * cellWidth
+                    let centerY = (CGFloat(r) + 0.5) * cellHeight
+
+                    ZStack(alignment: .center) {
+                        Color.white.opacity(0.001)
+                            .frame(width: cellWidth, height: cellHeight)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                handleBlankAreaTap()
+                            }
+
+                        gridCell(for: group)
                     }
-                    .frame(height: cellHeight)
+                    .frame(width: cellWidth, height: cellHeight)
+                    .position(x: centerX, y: centerY)
+                    .animation(.easeInOut(duration: 0.36), value: idx)
                 }
             }
+            .frame(width: gridWidth, height: gridHeight)
             .padding(.horizontal, horizontalMargin)
         }
     }
@@ -1458,7 +2515,8 @@ public struct LaunchpadRootView: View {
         let cellWidth = usableWidth / CGFloat(cols)
         let cellHeight = gridHeight / CGFloat(rows)
         let allItems = appManager.filteredGroups
-        let totalRows = Int(ceil(Double(allItems.count) / Double(cols)))
+        let totalRows = max(1, Int(ceil(Double(allItems.count) / Double(cols))))
+        let contentHeight = CGFloat(totalRows) * cellHeight
 
         return ScrollView(.vertical, showsIndicators: true) {
             ZStack {
@@ -1468,29 +2526,29 @@ public struct LaunchpadRootView: View {
                         handleBlankAreaTap()
                     }
 
-                VStack(spacing: 0) {
-                    ForEach(0..<totalRows, id: \.self) { r in
-                        HStack(spacing: 0) {
-                            ForEach(0..<cols, id: \.self) { c in
-                                let idx = r * cols + c
-                                ZStack(alignment: .center) {
-                                    Color.white.opacity(0.001)
-                                        .frame(width: cellWidth, height: cellHeight)
-                                        .contentShape(Rectangle())
-                                        .onTapGesture {
-                                            handleBlankAreaTap()
-                                        }
+                ZStack(alignment: .topLeading) {
+                    ForEach(Array(allItems.enumerated()), id: \.element.id) { idx, group in
+                        let r = idx / cols
+                        let c = idx % cols
+                        let centerX = (CGFloat(c) + 0.5) * cellWidth
+                        let centerY = (CGFloat(r) + 0.5) * cellHeight
 
-                                    if idx < allItems.count {
-                                        gridCell(for: allItems[idx])
-                                    }
-                                }
+                        ZStack(alignment: .center) {
+                            Color.white.opacity(0.001)
                                 .frame(width: cellWidth, height: cellHeight)
-                            }
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    handleBlankAreaTap()
+                                }
+
+                            gridCell(for: group)
                         }
-                        .frame(height: cellHeight)
+                        .frame(width: cellWidth, height: cellHeight)
+                        .position(x: centerX, y: centerY)
+                        .animation(.easeInOut(duration: 0.36), value: idx)
                     }
                 }
+                .frame(width: usableWidth, height: contentHeight)
                 .padding(.horizontal, horizontalMargin)
                 .padding(.vertical, 12)
             }
@@ -1506,28 +2564,89 @@ public struct LaunchpadRootView: View {
             if group.isFolder {
                 LaunchpadFolderCellView(
                     group: group,
-                    isDropTarget: dropTargetGroupID == group.id
+                    isMergeTarget: dragSession.mergeTargetGroupID == group.id,
+                    incomingDropApp: dragSession.mergeTargetGroupID == group.id ? dragSession.incomingDropApp : nil
                 )
             } else if let app = group.primaryApp {
                 LaunchpadAppCellView(
                     group: group,
                     app: app,
-                    isDropTarget: dropTargetGroupID == group.id
+                    isMergeTarget: dragSession.mergeTargetGroupID == group.id
                 )
             }
         }
-        .onDrag {
-            self.draggedGroupID = group.id
-            return NSItemProvider(object: group.id as NSString)
-        }
-        .onDrop(
-            of: [UTType.text],
-            delegate: GridGroupDropDelegate(
-                targetGroupID: group.id,
-                draggedGroupID: $draggedGroupID,
-                dropTargetGroupID: $dropTargetGroupID
-            )
+        .opacity(dragSession.isGroupHiddenAsPlaceholder(group.id) ? 0.0 : 1.0)
+        .background(
+            GeometryReader { cellGeo in
+                Color.clear
+                    .onAppear {
+                        let rect = cellGeo.frame(in: .named("LaunchpadRootSpace"))
+                        dragSession.cellFrames[group.id] = rect
+                        if group.isFolder {
+                            dragSession.folderIconFrames[group.id] = rect
+                        }
+                    }
+                    .onChange(of: cellGeo.frame(in: .named("LaunchpadRootSpace"))) { _, newRect in
+                        dragSession.cellFrames[group.id] = newRect
+                        if group.isFolder {
+                            dragSession.folderIconFrames[group.id] = newRect
+                        }
+                    }
+            }
         )
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .named("LaunchpadRootSpace"))
+                .onChanged { value in
+                    let dist = hypot(value.location.x - value.startLocation.x, value.location.y - value.startLocation.y)
+                    if dist <= 4.0 && !dragSession.isDragging {
+                        dragSession.beginPress(
+                            itemID: group.id,
+                            group: group,
+                            startLocation: value.startLocation
+                        )
+                    } else {
+                        dragSession.updateMainGridDrag(for: group, locationInRoot: value.location)
+                    }
+                }
+                .onEnded { value in
+                    let dist = hypot(value.location.x - value.startLocation.x, value.location.y - value.startLocation.y)
+                    if dragSession.isDragging {
+                        dragSession.endMainGridDrag()
+                    } else {
+                        dragSession.cancelPress()
+                        if dist <= 4.0 {
+                            handleCellClick(group: group)
+                        }
+                    }
+                }
+        )
+    }
+
+    private func handleCellClick(group: LaunchpadGroup) {
+        if appManager.inlineRenamingGroupID != nil && appManager.inlineRenamingGroupID != group.id {
+            appManager.inlineRenamingGroupID = nil
+        }
+        if NSEvent.modifierFlags.contains(.command) {
+            if appManager.selectedGroupIDs.contains(group.id) {
+                appManager.selectedGroupIDs.remove(group.id)
+            } else {
+                appManager.selectedGroupIDs.insert(group.id)
+            }
+            return
+        }
+        if group.isFolder {
+            dragSession.lastOpenedFolderSourceRect = dragSession.folderIconFrames[group.id] ?? dragSession.cellFrames[group.id]
+            withAnimation(.easeInOut(duration: 0.28)) {
+                appManager.openedFolderID = group.id
+            }
+        } else if let app = group.primaryApp {
+            if appManager.isUninstallJiggleMode {
+                UninstallWindowController.shared.present(for: app)
+            } else {
+                LaunchpadWindowController.shared.hide()
+                appManager.launchApp(app)
+            }
+        }
     }
 
     // MARK: - Bottom Page Indicator Dots
@@ -1550,10 +2669,19 @@ public struct LaunchpadRootView: View {
                             .scaleEffect(index == state.currentPage ? 1.18 : 1.0)
                             .animation(.spring(response: 0.28, dampingFraction: 0.8), value: state.currentPage)
                             .contentShape(Rectangle().inset(by: -6))
+                            .onHover { hovering in
+                                guard hovering, dragSession.isDragging, index != state.currentPage else { return }
+                                withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                                    state.currentPage = index
+                                }
+                                dragSession.handlePageSwitchDuringDrag(to: index)
+                            }
                             .onTapGesture {
+                                guard index != state.currentPage else { return }
                                 withAnimation(.spring(response: 0.38, dampingFraction: 0.86)) {
                                     state.currentPage = index
                                 }
+                                dragSession.handlePageSwitchDuringDrag(to: index)
                             }
                     }
                 }
@@ -1565,54 +2693,24 @@ public struct LaunchpadRootView: View {
     }
 }
 
-/// Drop delegate supporting drag-and-drop reorder and folder creation
-struct GridGroupDropDelegate: DropDelegate {
-    let targetGroupID: String
-    @Binding var draggedGroupID: String?
-    @Binding var dropTargetGroupID: String?
-
-    func dropEntered(info: DropInfo) {
-        guard let dragged = draggedGroupID, dragged != targetGroupID else { return }
-        dropTargetGroupID = targetGroupID
-    }
-
-    func dropExited(info: DropInfo) {
-        if dropTargetGroupID == targetGroupID {
-            dropTargetGroupID = nil
-        }
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        defer {
-            dropTargetGroupID = nil
-            draggedGroupID = nil
-        }
-        guard let dragged = draggedGroupID, dragged != targetGroupID else { return false }
-
-        let modifiers = NSEvent.modifierFlags
-        let targetIsFolder = ApplicationManager.shared.allGroups.first(where: { $0.id == targetGroupID })?.isFolder ?? false
-        let mergeIntoFolder = targetIsFolder || modifiers.contains(.command) || modifiers.contains(.shift)
-
-        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-            ApplicationManager.shared.moveGroup(
-                draggedID: dragged,
-                toTargetID: targetGroupID,
-                mergeIntoFolder: mergeIntoFolder
-            )
-        }
-        return true
-    }
-}
-
-/// Replicates `LaunchpadAppView` with tight icon+label hit-test region, hover, jiggle animation, multi-select, and context menu
+/// Replicates `LaunchpadAppView` (`0x1000f6c34`–`0x1000fc600`) & `LaunchpadGroupView` (`0x1001599c4`–`0x10015f64c`):
+/// - `layout` (`0x1000f6c5c`): `minSide = 96`, `d1 = trunc(minSide * 0.80) = 76`, `d2 = round(max(4.0, d1 * 0.26)) = 20`,
+///   `mergeView` cornerRadius = `round((minSide - d1) * 0.5 + d2) = 30`.
+/// - `mergeView` (`0x1000f92b0`): Glass merge indicator (`merge.opacity.in` / `merge.opacity.out`) when `isMergeTarget == true`.
+/// - `uninstallButton` (`0x1000f9a18`): Size `d9 = min(24.0, max(12.0, floor(minSide * 0.24))) = 23`, top-left spring scale `0.72 <-> 1.0`.
+/// - Jiggle animation (`0x10015bbc8`): Rotation `±1.72°` (`0.03 rad`, `0.115s`) + vertical bounce `±1.1px` (`0.13s`).
+/// - In-place rename editor (`titleEditorView` at `0x1000f8848`) & full context menu (`0x1000f6f30` / `0x100142c5c`).
 public struct LaunchpadAppCellView: View {
     public let group: LaunchpadGroup
     public let app: LaunchpadApp
-    public var isDropTarget: Bool = false
+    public var isMergeTarget: Bool = false
 
     @ObservedObject var state = AppState.shared
     @ObservedObject var appManager = ApplicationManager.shared
+    @ObservedObject var dragSession = LaunchpadDragSession.shared
     @LocalState private var isHovered: Bool = false
+    @LocalState private var editedTitle: String = ""
+    @FocusState private var isTitleFocused: Bool
 
     private let iconDimension: CGFloat = 96.0
 
@@ -1620,74 +2718,150 @@ public struct LaunchpadAppCellView: View {
         appManager.selectedGroupIDs.contains(group.id)
     }
 
+    private var isPressed: Bool {
+        dragSession.pressedItemID == group.id
+    }
+
     private var isSearchSelected: Bool {
         !appManager.currentSearchQuery.isEmpty && appManager.selectedSearchAppID == app.id
+    }
+
+    private var isRenamingInline: Bool {
+        appManager.inlineRenamingGroupID == group.id
+    }
+
+    /// Observed at `0x1000f6c5c`: `d1 = trunc(minSide * 0.80)`, `d2 = round(max(4.0, d1 * 0.26))`, `r = round((minSide - d1) * 0.5 + d2)`
+    private var mergeCornerRadius: CGFloat {
+        let d1 = trunc(iconDimension * 0.80)
+        let d2 = round(max(4.0, d1 * 0.26))
+        return round((iconDimension - d1) * 0.5 + d2)
+    }
+
+    /// Observed at `0x1000f9a18`: `d9 = min(24.0, max(12.0, floor(minSide * 0.24)))`
+    private var uninstallButtonSize: CGFloat {
+        min(24.0, max(12.0, floor(iconDimension * 0.24)))
     }
 
     public var body: some View {
         VStack(spacing: 8) {
             ZStack(alignment: .topLeading) {
+                // `mergeView` (`0x1000f92b0`: `merge.opacity.in` / `merge.opacity.out` when hovering center merge zone)
+                RoundedRectangle(cornerRadius: mergeCornerRadius, style: .continuous)
+                    .fill(Color.white.opacity(isMergeTarget ? 0.26 : 0.0))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: mergeCornerRadius, style: .continuous)
+                            .stroke(Color.white.opacity(isMergeTarget ? 0.42 : 0.0), lineWidth: 1.2)
+                    )
+                    .frame(width: iconDimension, height: iconDimension)
+                    .scaleEffect(isMergeTarget ? 1.08 : 0.92)
+                    .animation(.easeInOut(duration: 0.18), value: isMergeTarget)
+
+                // Selection highlight layer (`highlightLayer`, `#0x150`)
+                if isSelected {
+                    RoundedRectangle(cornerRadius: mergeCornerRadius, style: .continuous)
+                        .fill(Color.white.opacity(0.18))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: mergeCornerRadius, style: .continuous)
+                                .stroke(Color.accentColor.opacity(0.9), lineWidth: 2.2)
+                        )
+                        .frame(width: iconDimension, height: iconDimension)
+                }
+
                 Image(nsImage: AppIconRepository.shared.icon(for: app))
                     .resizable()
                     .interpolation(.high)
                     .frame(width: iconDimension, height: iconDimension)
-                    .scaleEffect(isSearchSelected ? 1.05 : (isHovered ? 1.05 : (isDropTarget ? 1.12 : 1.0)))
+                    .opacity(isPressed ? 0.80 : 1.0)
+                    .scaleEffect(isSearchSelected ? 1.05 : (isMergeTarget ? 1.08 : (isHovered && !dragSession.isDragging ? 1.05 : 1.0)))
                     .shadow(
                         color: isSearchSelected ? Color.accentColor.opacity(0.45) : .black.opacity(0.35),
                         radius: isSearchSelected ? 10 : (isHovered ? 8 : 5),
                         x: 0,
                         y: 4
                     )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: iconDimension * 0.22)
-                            .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 3)
-                    )
 
-                // Option-key Jiggle Uninstall Button
+                // `uninstallButton` (`0x1000f9a18`–`0x1000fa66c`: `uninstallButton.bouncy.scale` spring `0.72 <-> 1.0`)
                 if appManager.isUninstallJiggleMode {
                     Button {
                         UninstallWindowController.shared.present(for: app)
                     } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 20))
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(.white, .red)
-                            .shadow(radius: 2)
+                        ZStack {
+                            Circle()
+                                .fill(Color.white.opacity(0.92))
+                                .frame(width: uninstallButtonSize, height: uninstallButtonSize)
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: uninstallButtonSize))
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .red)
+                        }
+                        .shadow(color: .black.opacity(0.32), radius: 3, x: 0, y: 1)
                     }
                     .buttonStyle(.plain)
-                    .offset(x: -6, y: -6)
+                    .offset(x: 0, y: -0.2 * uninstallButtonSize)
+                    .transition(.scale(scale: 0.72).combined(with: .opacity))
                 }
             }
-            .rotationEffect(.degrees(appManager.isUninstallJiggleMode ? -2.2 : 0))
+            // Observed at `0x10015bbc8`: `launchos.uninstall.jiggle.rotation` (`±0.03 rad` = `±1.72°`) + `launchos.uninstall.jiggle.bounce` (`±1.1px`)
+            .rotationEffect(.degrees(appManager.isUninstallJiggleMode ? -1.72 : 0))
+            .offset(y: appManager.isUninstallJiggleMode ? -1.1 : 0)
             .animation(
                 appManager.isUninstallJiggleMode
-                    ? .easeInOut(duration: 0.13).repeatForever(autoreverses: true)
+                    ? .easeInOut(duration: 0.115).repeatForever(autoreverses: true)
                     : .spring(response: 0.22, dampingFraction: 0.8),
                 value: appManager.isUninstallJiggleMode
             )
 
             if !state.hideNames {
-                Text(app.displayName)
-                    .font(.system(size: 13.5, weight: isSearchSelected ? .semibold : .medium))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .padding(.horizontal, isSearchSelected ? 10 : 0)
-                    .padding(.vertical, isSearchSelected ? 3 : 0)
-                    .background(
-                        Group {
-                            if isSearchSelected {
-                                Capsule()
-                                    .fill(Color.black.opacity(0.60))
-                                    .overlay(
-                                        Capsule()
-                                            .stroke(Color.white.opacity(0.28), lineWidth: 0.8)
-                                    )
+                if isRenamingInline {
+                    TextField("应用名称", text: $editedTitle)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13.0, weight: .medium))
+                        .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.black.opacity(0.65))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .stroke(Color.accentColor.opacity(0.85), lineWidth: 1)
+                                )
+                        )
+                        .frame(width: iconDimension + 16, height: 22)
+                        .focused($isTitleFocused)
+                        .onSubmit {
+                            commitInlineRename()
+                        }
+                        .onAppear {
+                            editedTitle = app.displayName
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                isTitleFocused = true
                             }
                         }
-                    )
-                    .shadow(color: isSearchSelected ? .clear : .black.opacity(0.65), radius: 2, x: 0, y: 1)
-                    .frame(width: iconDimension + 16, height: 22, alignment: .center)
+                } else {
+                    Text(app.displayName)
+                        .font(.system(size: 13.5, weight: isSearchSelected ? .semibold : .medium))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, isSearchSelected ? 10 : 0)
+                        .padding(.vertical, isSearchSelected ? 3 : 0)
+                        .background(
+                            Group {
+                                if isSearchSelected {
+                                    Capsule()
+                                        .fill(Color.black.opacity(0.60))
+                                        .overlay(
+                                            Capsule()
+                                                .stroke(Color.white.opacity(0.28), lineWidth: 0.8)
+                                        )
+                                }
+                            }
+                        )
+                        .shadow(color: isSearchSelected ? .clear : .black.opacity(0.65), radius: 2, x: 0, y: 1)
+                        .frame(width: iconDimension + 16, height: 22, alignment: .center)
+                }
             }
         }
         .frame(width: iconDimension + 16)
@@ -1700,125 +2874,239 @@ public struct LaunchpadAppCellView: View {
                 }
             }
         }
-        .onTapGesture {
-            if NSEvent.modifierFlags.contains(.command) {
-                if appManager.selectedGroupIDs.contains(group.id) {
-                    appManager.selectedGroupIDs.remove(group.id)
-                } else {
-                    appManager.selectedGroupIDs.insert(group.id)
-                }
-            } else if appManager.isUninstallJiggleMode {
-                UninstallWindowController.shared.present(for: app)
-            } else {
-                LaunchpadWindowController.shared.hide()
-                appManager.launchApp(app)
-            }
-        }
         .contextMenu {
+            appContextMenuContent
+        }
+    }
+
+    private func commitInlineRename() {
+        let trimmed = editedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            appManager.renameGroup(groupID: group.id, newName: trimmed)
+        }
+        appManager.inlineRenamingGroupID = nil
+        isTitleFocused = false
+    }
+
+    @ViewBuilder
+    private var appContextMenuContent: some View {
+        // Multi-Select Context Menu (`LaunchpadContentView+MultiDrag.contextMenuForItem:` at `0x100142c5c`)
+        if isSelected && appManager.selectedGroupIDs.count > 1 {
+            let selectedIDs = Array(appManager.selectedGroupIDs)
+            Text("已选中 \(selectedIDs.count) 项")
+
+            Button("打开") {
+                LaunchpadWindowController.shared.hide()
+                let apps = appManager.allGroups.filter { appManager.selectedGroupIDs.contains($0.id) }.flatMap { $0.apps }
+                for item in apps {
+                    appManager.launchApp(item)
+                }
+            }
+
+            Button("合并为新文件夹") {
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    appManager.createFolder(withGroupIDs: appManager.selectedGroupIDs)
+                }
+            }
+
+            Menu("移动到") {
+                ForEach(0..<appManager.totalPages, id: \.self) { p in
+                    Button("第 \(p + 1) 页") {
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            appManager.moveItemsToPage(groupIDs: selectedIDs, targetPage: p)
+                        }
+                    }
+                    let foldersOnPage = appManager.groups(forPage: p).filter { $0.isFolder && !appManager.selectedGroupIDs.contains($0.id) }
+                    ForEach(foldersOnPage) { folder in
+                        Button("    ↳ \(folder.name)") {
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                appManager.moveAppsToFolder(groupIDs: selectedIDs, targetFolderID: folder.id)
+                            }
+                        }
+                    }
+                }
+                Divider()
+                Button("新建页面") {
+                    withAnimation(.easeInOut(duration: 0.28)) {
+                        appManager.moveItemsToPage(groupIDs: selectedIDs, targetPage: appManager.totalPages)
+                    }
+                }
+            }
+
+            Divider()
+
+            Button("隐藏") {
+                withAnimation(.easeInOut(duration: 0.24)) {
+                    appManager.hideApps(inGroupIDs: appManager.selectedGroupIDs)
+                }
+            }
+        } else {
+            // Single App Context Menu (`LaunchpadAppView.menu(for:)` at `0x1000f6f30`)
             Button {
                 LaunchpadWindowController.shared.hide()
                 appManager.launchApp(app)
             } label: {
-                Label("打开 \(app.displayName)", systemImage: "arrow.up.forward.app")
+                Label("打开", systemImage: "arrow.up.forward.app")
             }
 
             Button {
                 appManager.revealInFinder(app)
             } label: {
-                Label("在访达 (Finder) 中显示", systemImage: "folder")
-            }
-
-            Button {
-                appManager.showFinderGetInfo(app)
-            } label: {
-                Label("显示简介 (Get Info)", systemImage: "info.circle")
+                Label("在访达中显示", systemImage: "folder")
             }
 
             Button {
                 appManager.addAppToDock(app)
             } label: {
-                Label("添加到程序坞 (Dock)", systemImage: "dock.rectangle")
+                Label("添加到程序坞", systemImage: "dock.rectangle")
             }
 
             Divider()
 
-            Button {
-                if appManager.selectedGroupIDs.contains(group.id) {
-                    appManager.selectedGroupIDs.remove(group.id)
-                } else {
-                    appManager.selectedGroupIDs.insert(group.id)
-                }
-            } label: {
-                Label(isSelected ? "取消多选" : "多选以合并文件夹 (⌘点击)", systemImage: "checkmark.circle")
-            }
-
-            let folders = appManager.allGroups.filter(\.isFolder)
-            if !folders.isEmpty {
-                Menu("移入现有文件夹") {
-                    ForEach(folders) { targetFolder in
-                        Button(targetFolder.name) {
-                            appManager.moveGroup(draggedID: group.id, toTargetID: targetFolder.id, mergeIntoFolder: true)
-                        }
-                    }
-                }
-            }
-
-            if appManager.totalPages > 1 {
-                Menu("移动到指定页面") {
+            // `Move to` submenu (`0x1000f74d8`–`0x1000f7bc8`: Pages + indented `"    ↳ "` folders + `New Page`)
+            Menu("移动到") {
+                if state.browsingStyle == .paged {
                     ForEach(0..<appManager.totalPages, id: \.self) { p in
                         Button("第 \(p + 1) 页") {
-                            appManager.moveGroupToPage(group.id, targetPage: p)
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                appManager.moveGroupToPage(group.id, targetPage: p)
+                            }
+                        }
+                        let foldersOnPage = appManager.groups(forPage: p).filter { $0.isFolder }
+                        ForEach(foldersOnPage) { targetFolder in
+                            Button("    ↳ \(targetFolder.name)") {
+                                withAnimation(.easeInOut(duration: 0.28)) {
+                                    appManager.mergeGroups(draggedIDs: [group.id], intoTargetID: targetFolder.id)
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("新建页面") {
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            appManager.moveGroupToPage(group.id, targetPage: appManager.totalPages)
+                        }
+                    }
+                } else {
+                    let folders = appManager.allGroups.filter(\.isFolder)
+                    ForEach(folders) { targetFolder in
+                        Button(targetFolder.name) {
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                appManager.mergeGroups(draggedIDs: [group.id], intoTargetID: targetFolder.id)
+                            }
                         }
                     }
                 }
             }
 
-            Divider()
+            Button {
+                withAnimation(.easeInOut(duration: 0.24)) {
+                    appManager.hideApp(app)
+                }
+            } label: {
+                Label("隐藏", systemImage: "eye.slash")
+            }
 
             Button {
-                appManager.hideApp(app)
+                editedTitle = app.displayName
+                appManager.inlineRenamingGroupID = group.id
             } label: {
-                Label("在启动台中隐藏此应用", systemImage: "eye.slash")
+                Label("重命名", systemImage: "pencil")
             }
+
+            Button {
+                appManager.showFinderGetInfo(app)
+            } label: {
+                Label("显示简介", systemImage: "info.circle")
+            }
+
+            Divider()
 
             Button(role: .destructive) {
                 UninstallWindowController.shared.present(for: app)
             } label: {
-                Label("彻底卸载 \(app.displayName)...", systemImage: "trash")
+                Label("卸载...", systemImage: "trash")
             }
         }
     }
 }
 
-/// Replicates `LaunchpadGroupView` (3x3 miniature folder preview cell with tight hit-test region)
+/// Replicates `LaunchpadFolderView` (`0x100153b98`–`0x1001599c0`) & `LaunchpadGroupView`:
+/// - `layout` (`0x100154454`): `minSide = 96`, `d0 = trunc(minSide * 0.81) = 77`, `d2 = round(max(4.0, d0 * 0.26)) = 20`.
+/// - `folderMergeScale` (`0x100153cac`–`0x100153f80`): Scales `glassView` to `1.24x` (`0x3ff3d70a3d70a3d7`) over `0.18s` when `isMergeTarget == true`.
+/// - Live 3x3 Preview Grid (`0x100154630`–`0x100154ad4`): Displays up to 9 icons; when `incomingDropApp` is non-nil (`incomingDropAppID` at `0x100154860`),
+///   previews the incoming app icon live in the 9th slot of the 3x3 grid!
+/// - Context Menu (`0x100156808`): `Open`, `Rename` (in-place editor), `Move to` (`Page N` / `New Page`), `Ungroup` (`0x1001429c0`).
 public struct LaunchpadFolderCellView: View {
     public let group: LaunchpadGroup
-    public var isDropTarget: Bool = false
+    public var isMergeTarget: Bool = false
+    public var incomingDropApp: LaunchpadApp? = nil
 
     @ObservedObject var state = AppState.shared
     @ObservedObject var appManager = ApplicationManager.shared
+    @ObservedObject var dragSession = LaunchpadDragSession.shared
     @LocalState private var isHovered: Bool = false
+    @LocalState private var editedTitle: String = ""
+    @FocusState private var isTitleFocused: Bool
 
     private let iconDimension: CGFloat = 96.0
-    /// macOS app icons have an 824/1024 (80.47%) visible squircle body inside their canvas;
-    /// matching this ratio makes the folder squircle identical in visual size to regular app icons.
-    private var folderBoxDimension: CGFloat { round(iconDimension * 0.805) }
+    /// Observed at `0x100154454`: `d0 = trunc(minSide * 0.81)`
+    private var folderBoxDimension: CGFloat { trunc(iconDimension * 0.81) }
+
+    private var isSelected: Bool {
+        appManager.selectedGroupIDs.contains(group.id)
+    }
+
+    private var isPressed: Bool {
+        dragSession.pressedItemID == group.id
+    }
+
+    private var isRenamingInline: Bool {
+        appManager.inlineRenamingGroupID == group.id
+    }
+
+    /// Combines the folder's existing apps with `incomingDropApp` in the 3x3 preview (up to 9 slots, `0x100154860`)
+    private var previewApps: [LaunchpadApp] {
+        var list = Array(group.apps.prefix(9))
+        if let incoming = incomingDropApp, !list.contains(where: { $0.id == incoming.id }) {
+            if list.count >= 9 {
+                list[8] = incoming
+            } else {
+                list.append(incoming)
+            }
+        }
+        return list
+    }
 
     public var body: some View {
         let boxSize = folderBoxDimension
-        let boxCornerRadius = boxSize * 0.225
+        let boxCornerRadius = round(max(4.0, boxSize * 0.26))
         VStack(spacing: 8) {
             ZStack {
+                if isSelected {
+                    RoundedRectangle(cornerRadius: boxCornerRadius + 4, style: .continuous)
+                        .fill(Color.white.opacity(0.18))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: boxCornerRadius + 4, style: .continuous)
+                                .stroke(Color.accentColor.opacity(0.9), lineWidth: 2.2)
+                        )
+                        .frame(width: boxSize + 8, height: boxSize + 8)
+                }
+
+                // `glassView` (`#0x168`): scales to `1.24x` over `0.18s` (`folderMergeScale` at `0x100153cac`) when `isMergeTarget == true`
                 RoundedRectangle(cornerRadius: boxCornerRadius, style: .continuous)
-                    .fill(Color.white.opacity(isDropTarget ? 0.34 : 0.18))
+                    .fill(Color.white.opacity(isMergeTarget ? 0.34 : 0.20))
                     .overlay(
                         RoundedRectangle(cornerRadius: boxCornerRadius, style: .continuous)
-                            .stroke(Color.white.opacity(0.32), lineWidth: 1)
+                            .stroke(Color.white.opacity(isMergeTarget ? 0.52 : 0.32), lineWidth: 1)
                     )
                     .frame(width: boxSize, height: boxSize)
+                    .scaleEffect(isMergeTarget ? 1.24 : 1.0)
+                    .animation(.easeInOut(duration: 0.18), value: isMergeTarget)
                     .shadow(color: .black.opacity(0.28), radius: isHovered ? 10 : 5, x: 0, y: 4)
 
-                let previewApps = Array(group.apps.prefix(9))
+                // `contentView` (`FolderPreviewGridView`, `#0x170`): 3x3 icon preview grid
+                let currentPreviewApps = previewApps
                 let miniSpacing: CGFloat = 3.0
                 let miniSize = floor((boxSize * 0.78 - miniSpacing * 2) / 3.0)
                 LazyVGrid(
@@ -1826,11 +3114,12 @@ public struct LaunchpadFolderCellView: View {
                     alignment: .leading,
                     spacing: miniSpacing
                 ) {
-                    ForEach(previewApps) { app in
+                    ForEach(currentPreviewApps) { app in
                         Image(nsImage: AppIconRepository.shared.icon(for: app, pointSize: 48))
                             .resizable()
                             .interpolation(.high)
                             .frame(width: miniSize, height: miniSize)
+                            .transition(.scale.combined(with: .opacity))
                     }
                 }
                 .frame(
@@ -1838,17 +3127,56 @@ public struct LaunchpadFolderCellView: View {
                     height: miniSize * 3 + miniSpacing * 2,
                     alignment: .topLeading
                 )
+                .animation(.easeInOut(duration: 0.18), value: currentPreviewApps.map { $0.id })
             }
             .frame(width: iconDimension, height: iconDimension)
-            .scaleEffect(isHovered ? 1.07 : (isDropTarget ? 1.14 : 1.0))
+            .opacity(isPressed ? 0.80 : 1.0)
+            .scaleEffect(isHovered && !dragSession.isDragging && !isMergeTarget ? 1.05 : 1.0)
+            .rotationEffect(.degrees(appManager.isUninstallJiggleMode ? -1.72 : 0))
+            .offset(y: appManager.isUninstallJiggleMode ? -1.1 : 0)
+            .animation(
+                appManager.isUninstallJiggleMode
+                    ? .easeInOut(duration: 0.115).repeatForever(autoreverses: true)
+                    : .spring(response: 0.22, dampingFraction: 0.8),
+                value: appManager.isUninstallJiggleMode
+            )
 
             if !state.hideNames {
-                Text(group.name)
-                    .font(.system(size: 13.5, weight: .medium))
-                    .foregroundColor(.white)
-                    .shadow(color: .black.opacity(0.65), radius: 2, x: 0, y: 1)
-                    .lineLimit(1)
-                    .frame(width: iconDimension + 6, height: 18, alignment: .center)
+                if isRenamingInline {
+                    TextField("未命名文件夹", text: $editedTitle)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13.0, weight: .medium))
+                        .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.black.opacity(0.65))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .stroke(Color.accentColor.opacity(0.85), lineWidth: 1)
+                                )
+                        )
+                        .frame(width: iconDimension + 16, height: 22)
+                        .focused($isTitleFocused)
+                        .onSubmit {
+                            commitInlineRename()
+                        }
+                        .onAppear {
+                            editedTitle = group.name
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                isTitleFocused = true
+                            }
+                        }
+                } else {
+                    Text(group.name)
+                        .font(.system(size: 13.5, weight: .medium))
+                        .foregroundColor(.white)
+                        .shadow(color: .black.opacity(0.65), radius: 2, x: 0, y: 1)
+                        .lineLimit(1)
+                        .frame(width: iconDimension + 6, height: 18, alignment: .center)
+                }
             }
         }
         .frame(width: iconDimension + 6)
@@ -1858,26 +3186,61 @@ public struct LaunchpadFolderCellView: View {
                 isHovered = hovering
             }
         }
-        .onTapGesture {
-            withAnimation(.easeInOut(duration: 0.28)) {
-                appManager.openedFolderID = group.id
-            }
-        }
         .contextMenu {
+            // `LaunchpadFolderView.menu(for:)` (`0x100156808`)
             Button {
+                dragSession.lastOpenedFolderSourceRect = dragSession.folderIconFrames[group.id] ?? dragSession.cellFrames[group.id]
                 withAnimation(.easeInOut(duration: 0.28)) {
                     appManager.openedFolderID = group.id
                 }
             } label: {
-                Label("打开文件夹", systemImage: "folder")
+                Label("打开", systemImage: "folder")
             }
 
-            Button(role: .destructive) {
-                appManager.ungroupFolder(groupID: group.id)
+            Button {
+                editedTitle = group.name
+                appManager.inlineRenamingGroupID = group.id
             } label: {
-                Label("解散文件夹 (平铺内部应用)", systemImage: "folder.badge.minus")
+                Label("重命名", systemImage: "pencil")
+            }
+
+            if state.browsingStyle == .paged {
+                Menu("移动到") {
+                    ForEach(0..<appManager.totalPages, id: \.self) { p in
+                        Button("第 \(p + 1) 页") {
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                appManager.moveGroupToPage(group.id, targetPage: p)
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("新建页面") {
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            appManager.moveGroupToPage(group.id, targetPage: appManager.totalPages)
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            Button(role: .destructive) {
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    appManager.ungroupFolder(groupID: group.id)
+                }
+            } label: {
+                Label("解散文件夹", systemImage: "folder.badge.minus")
             }
         }
+    }
+
+    private func commitInlineRename() {
+        let trimmed = editedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            appManager.renameGroup(groupID: group.id, newName: trimmed)
+        }
+        appManager.inlineRenamingGroupID = nil
+        isTitleFocused = false
     }
 }
 
@@ -1942,16 +3305,20 @@ public struct OpenedFolderGlassRepresentable: NSViewRepresentable {
 /// - `openedFolderBackdropView` (`#0x9c8`): full-screen clickable backdrop (`black.opacity(0.20)` in full-screen, `.clear` in window mode)
 /// - `openedFolderTitleLabel` (`#0x9e8`): placed **28.0 pt ABOVE** the folder glass card (`15.0 pt` in window mode), centered horizontally, `.largeTitle` (`26pt .regular`), click-to-edit in-place via `openedFolderTitleEditorView` (`#0x9f8`)
 /// - `openedFolderBackButton` (`#0x9f0`): `32×32` button with `"chevron.left"` (`17pt .regular`) at `cardMinX + 16`, visible in window mode
-/// - `openedFolderClipView` / `openedFolderBlurView` (`#0x9d0` / `#0x9d8`): `NSGlassEffectView` card sized to `cols * cellWidth` wide and `visibleRows * cellHeight + 2 * vPad` tall (`visibleRows = max(1, min(totalRows, maxRows))`), cornerRadius `max(16.0, min(cellWidth, cellHeight) * 0.24)` (`30.0` in window mode), vertically shifted down by `27.0 pt` (`54.0 * 0.5`) to balance the title above
+/// - `openedFolderClipView` / `openedFolderBlurView` (`#0x9d0` / `#0x9d8`): `NSGlassEffectView` card sized to `cols * cellWidth` wide and `visibleRows * cellHeight + 2 * vPad` tall (`visibleRows = max(1, min(totalRows, maxRows))`), cornerRadius `max(16.0, min(cellWidth, cellHeight) * 0.24)` (`30.0` in window mode)
+/// - `0.28s` `.easeInEaseOut` hero morph (`0x10011e950`–`0x100126a14`) from/to the clicked folder cell's exact frame (`sourceFolderRect`)
 public struct OpenedFolderOverlayView: View {
     public let group: LaunchpadGroup
     public let containerSize: CGSize
     public let gridAreaHeight: CGFloat
+    public var sourceFolderRect: CGRect? = nil
 
     @ObservedObject var state = AppState.shared
     @ObservedObject var appManager = ApplicationManager.shared
+    @ObservedObject var dragSession = LaunchpadDragSession.shared
     @LocalState private var folderName: String = ""
     @LocalState private var isEditingTitle: Bool = false
+    @LocalState private var morphProgress: CGFloat = 0.0
     @FocusState private var isTitleFieldFocused: Bool
 
     public var body: some View {
@@ -1994,14 +3361,30 @@ public struct OpenedFolderOverlayView: View {
             ? "未命名文件夹"
             : group.name
 
+        // Hero morph interpolation (`0x10011e950`–`0x100126a14`: `0.28s` `.easeInEaseOut` from folder icon rect)
+        let srcRect = sourceFolderRect ?? CGRect(
+            x: containerSize.width * 0.5 - 38.0,
+            y: containerSize.height * 0.5 - 38.0,
+            width: 77.0,
+            height: 77.0
+        )
+        let startOffsetX = srcRect.midX - containerSize.width * 0.5
+        let startOffsetY = srcRect.midY - containerSize.height * 0.5
+        let startScale = max(0.12, min(0.35, srcRect.width / max(1.0, cardWidth)))
+        let currentScale = startScale + (1.0 - startScale) * morphProgress
+        let currentOffsetX = startOffsetX * (1.0 - morphProgress)
+        let currentOffsetY = startOffsetY * (1.0 - morphProgress) + (isWindowMode ? 0 : -4.0) * morphProgress
+
         ZStack {
             // 1. `openedFolderBackdropView` (`#0x9c8`, `0x100122360`–`0x100122470`)
-            (isWindowMode ? Color.clear : Color.black.opacity(0.20))
+            (isWindowMode ? Color.clear : Color.black.opacity(0.20 * Double(morphProgress)))
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture {
                     if isEditingTitle {
                         commitRename()
+                    } else if appManager.inlineRenamingFolderAppID != nil {
+                        appManager.inlineRenamingFolderAppID = nil
                     } else {
                         closeFolder()
                     }
@@ -2065,6 +3448,7 @@ public struct OpenedFolderOverlayView: View {
                     }
                 }
                 .frame(width: cardWidth, height: titleHeight)
+                .opacity(Double(morphProgress))
 
                 // 3. `openedFolderClipView` + `openedFolderBlurView` (`NSGlassEffectView`) + `openedFolderScrollView`
                 ZStack {
@@ -2085,6 +3469,8 @@ public struct OpenedFolderOverlayView: View {
                         // clicking empty space inside the card otherwise does not dismiss the folder (`0x100120634`).
                         if isEditingTitle {
                             commitRename()
+                        } else if appManager.inlineRenamingFolderAppID != nil {
+                            appManager.inlineRenamingFolderAppID = nil
                         }
                     }
 
@@ -2092,61 +3478,87 @@ public struct OpenedFolderOverlayView: View {
                     ScrollView(.vertical, showsIndicators: totalRows > visibleRows) {
                         let contentGridHeight = CGFloat(totalRows) * cellHeight
                         let verticalCenterOffset = max(0.0, (scrollHeight - contentGridHeight) * 0.5)
+                        let gridContentWidth = cellWidth * CGFloat(cols)
+                        let horizontalGridOffset = max(0.0, (cardWidth - gridContentWidth) * 0.5)
 
-                        VStack(spacing: 0) {
-                            if verticalCenterOffset > 0 {
-                                Spacer().frame(height: verticalCenterOffset)
-                            }
-                            ForEach(0..<totalRows, id: \.self) { r in
-                                HStack(spacing: 0) {
-                                    ForEach(0..<cols, id: \.self) { c in
-                                        let idx = r * cols + c
-                                        ZStack(alignment: .center) {
-                                            Color.white.opacity(0.001)
-                                                .frame(width: cellWidth, height: cellHeight)
-                                                .contentShape(Rectangle())
-                                                .onTapGesture {
-                                                    if isEditingTitle {
-                                                        commitRename()
-                                                    } else {
-                                                        closeFolder()
-                                                    }
-                                                }
-
-                                            if idx < group.apps.count {
-                                                LaunchpadFolderInnerAppCellView(
-                                                    folderGroup: group,
-                                                    app: group.apps[idx]
-                                                )
-                                            }
-                                        }
-                                        .frame(width: cellWidth, height: cellHeight)
+                        ZStack(alignment: .topLeading) {
+                            Color.white.opacity(0.001)
+                                .frame(width: cardWidth, height: max(scrollHeight, contentGridHeight))
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    if isEditingTitle {
+                                        commitRename()
+                                    } else if appManager.inlineRenamingFolderAppID != nil {
+                                        appManager.inlineRenamingFolderAppID = nil
+                                    } else {
+                                        closeFolder()
                                     }
                                 }
-                                .frame(width: cellWidth * CGFloat(cols), height: cellHeight)
-                            }
-                            if verticalCenterOffset > 0 {
-                                Spacer().frame(height: verticalCenterOffset)
+
+                            ForEach(Array(group.apps.enumerated()), id: \.element.id) { idx, app in
+                                let r = idx / cols
+                                let c = idx % cols
+                                let centerX = horizontalGridOffset + (CGFloat(c) + 0.5) * cellWidth
+                                let centerY = verticalCenterOffset + (CGFloat(r) + 0.5) * cellHeight
+
+                                ZStack(alignment: .center) {
+                                    Color.white.opacity(0.001)
+                                        .frame(width: cellWidth, height: cellHeight)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            if isEditingTitle {
+                                                commitRename()
+                                            } else if appManager.inlineRenamingFolderAppID != nil {
+                                                appManager.inlineRenamingFolderAppID = nil
+                                            } else {
+                                                closeFolder()
+                                            }
+                                        }
+
+                                    LaunchpadFolderInnerAppCellView(
+                                        folderGroup: group,
+                                        app: app
+                                    )
+                                }
+                                .frame(width: cellWidth, height: cellHeight)
+                                .position(x: centerX, y: centerY)
+                                .animation(.easeInOut(duration: 0.36), value: idx)
                             }
                         }
-                        .frame(width: cardWidth, height: max(scrollHeight, contentGridHeight), alignment: .top)
+                        .frame(width: cardWidth, height: max(scrollHeight, contentGridHeight), alignment: .topLeading)
                     }
                     .frame(width: cardWidth, height: scrollHeight)
                 }
                 .frame(width: cardWidth, height: cardHeight)
+                .background(
+                    GeometryReader { cardGeo in
+                        Color.clear
+                            .onAppear {
+                                dragSession.openedFolderCardFrame = cardGeo.frame(in: .named("LaunchpadRootSpace"))
+                            }
+                            .onChange(of: cardGeo.frame(in: .named("LaunchpadRootSpace"))) { _, newRect in
+                                dragSession.openedFolderCardFrame = newRect
+                            }
+                    }
+                )
             }
-            // `0x100121944`: Card is shifted slightly downward (`(titleHeight + titleBottomGap - 54.0) * 0.5`) so the card + top title balance visually
-            .offset(y: isWindowMode ? 0 : -4.0)
+            .scaleEffect(currentScale)
+            .opacity(Double(max(0.15, morphProgress)))
+            .offset(x: currentOffsetX, y: currentOffsetY)
         }
         .frame(width: containerSize.width, height: containerSize.height)
         .onAppear {
             folderName = group.name
+            withAnimation(.easeInOut(duration: 0.28)) {
+                morphProgress = 1.0
+            }
         }
     }
 
     private func closeFolder() {
         commitRename()
         withAnimation(.easeInOut(duration: 0.28)) {
+            morphProgress = 0.0
             appManager.openedFolderID = nil
         }
     }
@@ -2164,16 +3576,32 @@ public struct OpenedFolderOverlayView: View {
 }
 
 /// App cell inside an opened folder (`openedFolderAppViews`, `0x100121cb8`–`0x100121d54`),
-/// sharing the exact `96pt` icon size and typography of `LaunchpadAppCellView`.
+/// supporting live drag-reordering inside the folder (`0.36s`), dragging outside the folder card to detach onto the main grid (`0x10011abdc`),
+/// `0.55s` long-press uninstall jiggle mode (`±1.72°` rotation + `±1.1px` bounce), in-place renaming, and full context menu.
 public struct LaunchpadFolderInnerAppCellView: View {
     public let folderGroup: LaunchpadGroup
     public let app: LaunchpadApp
 
     @ObservedObject var state = AppState.shared
     @ObservedObject var appManager = ApplicationManager.shared
+    @ObservedObject var dragSession = LaunchpadDragSession.shared
     @LocalState private var isHovered: Bool = false
+    @LocalState private var editedTitle: String = ""
+    @FocusState private var isTitleFocused: Bool
 
     private let iconDimension: CGFloat = 96.0
+
+    private var isPressed: Bool {
+        dragSession.pressedItemID == app.id
+    }
+
+    private var isRenamingInline: Bool {
+        appManager.inlineRenamingFolderAppID == app.id
+    }
+
+    private var uninstallButtonSize: CGFloat {
+        min(24.0, max(12.0, floor(iconDimension * 0.24)))
+    }
 
     public var body: some View {
         VStack(spacing: 8) {
@@ -2182,80 +3610,209 @@ public struct LaunchpadFolderInnerAppCellView: View {
                     .resizable()
                     .interpolation(.high)
                     .frame(width: iconDimension, height: iconDimension)
-                    .scaleEffect(isHovered ? 1.07 : 1.0)
+                    .opacity(isPressed ? 0.80 : 1.0)
+                    .scaleEffect(isHovered && !dragSession.isDragging ? 1.05 : 1.0)
                     .shadow(color: .black.opacity(0.35), radius: isHovered ? 10 : 5, x: 0, y: 4)
 
                 if appManager.isUninstallJiggleMode {
                     Button {
                         UninstallWindowController.shared.present(for: app)
                     } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 20))
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(.white, .red)
-                            .shadow(radius: 2)
+                        ZStack {
+                            Circle()
+                                .fill(Color.white.opacity(0.92))
+                                .frame(width: uninstallButtonSize, height: uninstallButtonSize)
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: uninstallButtonSize))
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .red)
+                        }
+                        .shadow(color: .black.opacity(0.32), radius: 3, x: 0, y: 1)
                     }
                     .buttonStyle(.plain)
-                    .offset(x: -6, y: -6)
+                    .offset(x: 0, y: -0.2 * uninstallButtonSize)
+                    .transition(.scale(scale: 0.72).combined(with: .opacity))
                 }
             }
-            .rotationEffect(.degrees(appManager.isUninstallJiggleMode ? -2.2 : 0))
+            .rotationEffect(.degrees(appManager.isUninstallJiggleMode ? -1.72 : 0))
+            .offset(y: appManager.isUninstallJiggleMode ? -1.1 : 0)
             .animation(
                 appManager.isUninstallJiggleMode
-                    ? .easeInOut(duration: 0.13).repeatForever(autoreverses: true)
+                    ? .easeInOut(duration: 0.115).repeatForever(autoreverses: true)
                     : .spring(response: 0.22, dampingFraction: 0.8),
                 value: appManager.isUninstallJiggleMode
             )
 
             if !state.hideNames {
-                Text(app.displayName)
-                    .font(.system(size: 13.5, weight: .medium))
-                    .foregroundColor(.white)
-                    .shadow(color: .black.opacity(0.65), radius: 2, x: 0, y: 1)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(width: iconDimension + 6, height: 18, alignment: .center)
+                if isRenamingInline {
+                    TextField("应用名称", text: $editedTitle)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13.0, weight: .medium))
+                        .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.black.opacity(0.65))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .stroke(Color.accentColor.opacity(0.85), lineWidth: 1)
+                                )
+                        )
+                        .frame(width: iconDimension + 16, height: 22)
+                        .focused($isTitleFocused)
+                        .onSubmit {
+                            commitInlineRename()
+                        }
+                        .onAppear {
+                            editedTitle = app.displayName
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                isTitleFocused = true
+                            }
+                        }
+                } else {
+                    Text(app.displayName)
+                        .font(.system(size: 13.5, weight: .medium))
+                        .foregroundColor(.white)
+                        .shadow(color: .black.opacity(0.65), radius: 2, x: 0, y: 1)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(width: iconDimension + 6, height: 18, alignment: .center)
+                }
             }
         }
         .frame(width: iconDimension + 6)
+        .opacity(dragSession.isFolderAppHiddenAsPlaceholder(app.id) ? 0.0 : 1.0)
         .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(
+            GeometryReader { cellGeo in
+                Color.clear
+                    .onAppear {
+                        dragSession.openedFolderAppFrames[app.id] = cellGeo.frame(in: .named("LaunchpadRootSpace"))
+                    }
+                    .onChange(of: cellGeo.frame(in: .named("LaunchpadRootSpace"))) { _, newRect in
+                        dragSession.openedFolderAppFrames[app.id] = newRect
+                    }
+            }
+        )
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.15)) {
                 isHovered = hovering
             }
         }
-        .onTapGesture {
-            if appManager.isUninstallJiggleMode {
-                UninstallWindowController.shared.present(for: app)
-            } else {
-                LaunchpadWindowController.shared.hide()
-                appManager.launchApp(app)
-            }
-        }
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .named("LaunchpadRootSpace"))
+                .onChanged { value in
+                    let dist = hypot(value.location.x - value.startLocation.x, value.location.y - value.startLocation.y)
+                    if dist <= 4.0 && !dragSession.isDragging {
+                        dragSession.beginPress(
+                            itemID: app.id,
+                            folder: folderGroup,
+                            folderApp: app,
+                            startLocation: value.startLocation
+                        )
+                    } else {
+                        dragSession.updateFolderAppDrag(folder: folderGroup, app: app, locationInRoot: value.location)
+                    }
+                }
+                .onEnded { value in
+                    let dist = hypot(value.location.x - value.startLocation.x, value.location.y - value.startLocation.y)
+                    if dragSession.isDragging {
+                        dragSession.endFolderAppDrag()
+                    } else {
+                        dragSession.cancelPress()
+                        if dist <= 4.0 {
+                            if appManager.inlineRenamingFolderAppID != nil && appManager.inlineRenamingFolderAppID != app.id {
+                                appManager.inlineRenamingFolderAppID = nil
+                            }
+                            if appManager.isUninstallJiggleMode {
+                                UninstallWindowController.shared.present(for: app)
+                            } else {
+                                LaunchpadWindowController.shared.hide()
+                                appManager.launchApp(app)
+                            }
+                        }
+                    }
+                }
+        )
         .contextMenu {
             Button {
                 LaunchpadWindowController.shared.hide()
                 appManager.launchApp(app)
             } label: {
-                Label("打开 \(app.displayName)", systemImage: "arrow.up.forward.app")
+                Label("打开", systemImage: "arrow.up.forward.app")
             }
 
             Button {
                 appManager.revealInFinder(app)
             } label: {
-                Label("在访达 (Finder) 中显示", systemImage: "folder")
+                Label("在访达中显示", systemImage: "folder")
             }
 
             Button {
-                appManager.removeAppFromFolder(appID: app.id, folderID: folderGroup.id)
+                appManager.addAppToDock(app)
+            } label: {
+                Label("添加到程序坞", systemImage: "dock.rectangle")
+            }
+
+            Divider()
+
+            Menu("移动到") {
+                ForEach(0..<appManager.totalPages, id: \.self) { p in
+                    Button("第 \(p + 1) 页") {
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            appManager.moveFolderAppToPage(appID: app.id, folderID: folderGroup.id, targetPage: p)
+                        }
+                    }
+                    let foldersOnPage = appManager.groups(forPage: p).filter { $0.isFolder && $0.id != folderGroup.id }
+                    ForEach(foldersOnPage) { targetFolder in
+                        Button("    ↳ \(targetFolder.name)") {
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                appManager.moveFolderAppToAnotherFolder(
+                                    appID: app.id,
+                                    sourceFolderID: folderGroup.id,
+                                    targetFolderID: targetFolder.id
+                                )
+                            }
+                        }
+                    }
+                }
+                Divider()
+                Button("新建页面") {
+                    withAnimation(.easeInOut(duration: 0.28)) {
+                        appManager.moveFolderAppToPage(appID: app.id, folderID: folderGroup.id, targetPage: appManager.totalPages)
+                    }
+                }
+            }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    appManager.removeAppFromFolder(appID: app.id, folderID: folderGroup.id)
+                }
             } label: {
                 Label("移出文件夹", systemImage: "folder.badge.minus")
             }
 
             Button {
-                appManager.ungroupFolder(groupID: folderGroup.id)
+                withAnimation(.easeInOut(duration: 0.24)) {
+                    appManager.hideApp(app)
+                }
             } label: {
-                Label("解散此文件夹", systemImage: "rectangle.grid.2x2")
+                Label("隐藏", systemImage: "eye.slash")
+            }
+
+            Button {
+                editedTitle = app.displayName
+                appManager.inlineRenamingFolderAppID = app.id
+            } label: {
+                Label("重命名", systemImage: "pencil")
+            }
+
+            Button {
+                appManager.showFinderGetInfo(app)
+            } label: {
+                Label("显示简介", systemImage: "info.circle")
             }
 
             Divider()
@@ -2263,8 +3820,17 @@ public struct LaunchpadFolderInnerAppCellView: View {
             Button(role: .destructive) {
                 UninstallWindowController.shared.present(for: app)
             } label: {
-                Label("彻底卸载 \(app.displayName)...", systemImage: "trash")
+                Label("卸载...", systemImage: "trash")
             }
         }
+    }
+
+    private func commitInlineRename() {
+        let trimmed = editedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            appManager.renameAppInFolder(folderID: folderGroup.id, appID: app.id, newName: trimmed)
+        }
+        appManager.inlineRenamingFolderAppID = nil
+        isTitleFocused = false
     }
 }
